@@ -81,7 +81,7 @@ impl MachO {
         let magic_be = rdbe32(&hdr, 0);
         let (off, size) = if magic_be == FAT_MAGIC || magic_be == FAT_MAGIC_64 {
             let nfat = rdbe32(&hdr, 4) as usize;
-            let mut best: Option<(u64, u64, bool)> = None;
+            let mut best: Option<(u64, u64, u8)> = None;
             for i in 0..nfat {
                 let (cpu, sub, off, size) = if magic_be == FAT_MAGIC {
                     let o = 8 + i * 20;
@@ -92,14 +92,10 @@ impl MachO {
                 };
                 if cpu == CPU_TYPE_ARM64 {
                     let is_e = (sub & 0xff) == CPU_SUBTYPE_ARM64E;
-                    // Avoid special variants like arm64e.x1 unless nothing else.
-                    let special = (sub & 0x00ff_ff00) != 0 && is_e && (sub & 0xff00_0000) == 0 && false;
-                    let _ = special;
-                    match best {
-                        None => best = Some((off, size, is_e)),
-                        Some((_, _, be)) if be != prefer_e && is_e == prefer_e => best = Some((off, size, is_e)),
-                        _ => {}
-                    }
+                    // Unknown subtypes (e.g. 12, GG 26A434's PAuth_LR arm64e slice) only if nothing else.
+                    let known = matches!(sub & 0xff, 0 | 1 | 2);
+                    let rank = if !known { 0 } else if is_e == prefer_e { 2 } else { 1 };
+                    if best.map_or(true, |(_, _, r)| rank > r) { best = Some((off, size, rank)); }
                 }
             }
             let (o, s, _) = best.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("{path}: no arm64 slice")))?;

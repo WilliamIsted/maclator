@@ -35,7 +35,20 @@ fn usage() -> ! {
 }
 
 fn main() {
+    let argv0 = std::env::args().next().unwrap_or_default();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Kernel-chosen interpreter: `maclator-exec <target> <args...>` (the #! convention), or `--auto`.
+    let auto = argv0.rsplit('/').next() == Some("maclator-exec") || args.first().map(|a| a == "--auto").unwrap_or(false);
+    if auto {
+        if args.first().map(|a| a == "--auto").unwrap_or(false) {
+            args.remove(0);
+        }
+        AUTO.store(true, Ordering::Relaxed);
+        // Config options go first, so flags that spawn.rs forwards to re-launched children override them.
+        let mut opts = auto_options(&conf_path());
+        opts.append(&mut args);
+        args = opts;
+    }
     let mut dyld = std::env::var("MACLATOR_DYLD").unwrap_or_else(|_| "/usr/lib/dyld".to_string());
     while let Some(a) = args.first().cloned() {
         match a.as_str() {
@@ -125,7 +138,13 @@ fn main() {
         }
     }
     if args.is_empty() {
+        if AUTO.load(Ordering::Relaxed) {
+            fail("no target program");
+        }
         usage();
+    }
+    if AUTO.load(Ordering::Relaxed) && !std::path::Path::new(&args[0]).exists() {
+        fail(&format!("{}: no such file", args[0]));
     }
     if paths::cache_dir().is_none() && !std::path::Path::new("/System/Library/dyld/dyld_shared_cache_arm64e").exists() {
         if let Some(d) = paths::discover_sysroot() {
@@ -195,6 +214,9 @@ fn main() {
     let (loaded, mut cpu) = match loader::load(&exe, &dyld, &args, &envp) {
         Ok(v) => v,
         Err(e) => {
+            if AUTO.load(Ordering::Relaxed) {
+                fail(&format!("{exe}: {e}"));
+            }
             eprintln!("maclator: {e}");
             std::process::exit(1);
         }
@@ -221,6 +243,98 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     std::process::exit(0);
+}
+
+/// Set in auto mode: failures go to syslog too and exit 126.
+static AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn conf_path() -> String {
+    std::env::var("MACLATOR_CONF").unwrap_or_else(|_| "/usr/local/etc/maclator.conf".to_string())
+}
+
+/// Auto-mode failure: stderr and syslog, exit 126 (as a shell does for "found but cannot execute").
+fn fail(msg: &str) -> ! {
+    eprintln!("maclator-exec: {msg}");
+    if let Ok(c) = std::ffi::CString::new(format!("maclator-exec: {msg}")) {
+        unsafe { libc::syslog(libc::LOG_ERR, b"%s\0".as_ptr() as *const libc::c_char, c.as_ptr()) };
+    }
+    std::process::exit(126);
+}
+
+/// Read `key=value` lines from the auto-mode config and turn them into command-line options.
+/// Keys: `sysroot`, `dyld`, `gpu` (1/0), `mount` (mount point for the kit volume when the sysroot
+/// is absent); upper-case keys (e.g. `MCL_DS_FLAG=1`) are environment defaults for the guest.
+fn auto_options(conf: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(conf).unwrap_or_else(|e| fail(&format!("{conf}: {e}")));
+    let (mut opts, mut sysroot, mut mount) = (Vec::new(), None, None);
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let Some((k, v)) = line.split_once('=') else { fail(&format!("{conf}: bad line: {line}")) };
+        let (k, v) = (k.trim(), v.trim());
+        match k {
+            "sysroot" => sysroot = Some(v.to_string()),
+            "dyld" => opts.extend(["--dyld".to_string(), v.to_string()]),
+            "gpu" => {
+                if v == "1" {
+                    opts.push("--gpu".into());
+                }
+            }
+            "mount" => mount = Some(v.to_string()),
+            _ if k.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
+                if std::env::var_os(k).is_none() {
+                    std::env::set_var(k, v);
+                }
+            }
+            _ => fail(&format!("{conf}: unknown key {k}")),
+        }
+    }
+    if let Some(s) = sysroot {
+        if !std::path::Path::new(&s).is_dir() {
+            match &mount {
+                Some(mp) => mount_kit(mp, &s),
+                None => fail(&format!("sysroot {s} not found and no mount= in {conf}")),
+            }
+        }
+        opts.extend(["--sysroot".to_string(), s]);
+    }
+    opts
+}
+
+/// Mount the kit volume read-only at `mp` until `want` appears: GG's diskutil cannot find it by
+/// UUID (boot 57), so try each APFS slice in turn, as gg-revisiond.sh does.
+// One prober at a time (boot 93: concurrent execs unmounted each other's probes): flock a lock file,
+// then recheck `want`, since the holder before us may have mounted it. The lock drops at exit/exec.
+fn mount_kit(mp: &str, want: &str) {
+    let _ = std::fs::create_dir_all(mp);
+    use std::os::unix::io::AsRawFd;
+    let lock = std::fs::OpenOptions::new().create(true).write(true).open("/var/run/maclator-mount.lock");
+    if let Ok(f) = &lock {
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+        if std::path::Path::new(want).is_dir() {
+            return;
+        }
+    }
+    let mut devs: Vec<String> = std::fs::read_dir("/dev")
+        .map(|d| d.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect())
+        .unwrap_or_default();
+    devs.retain(|n| n.starts_with("disk") && n[4..].contains('s'));
+    devs.sort();
+    for dv in devs {
+        if std::path::Path::new(want).is_dir() {
+            return;
+        }
+        let ok = std::process::Command::new("/sbin/mount_apfs")
+            .args(["-o", "rdonly", &format!("/dev/{dv}"), mp])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok && !std::path::Path::new(want).is_dir() {
+            let _ = std::process::Command::new("/sbin/umount").arg(mp).status();
+        }
+    }
+    if !std::path::Path::new(want).is_dir() {
+        fail(&format!("sysroot {want} not found on any APFS slice"));
+    }
 }
 
 fn resolve_path(p: &str) -> String {

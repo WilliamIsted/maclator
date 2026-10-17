@@ -129,6 +129,7 @@ static BOOL isNewFamily(const char *s) {
 }
 
 
+extern void _objc_msgForward(void);
 @implementation MCLProxy
 - (instancetype)initWithInfo:(NSDictionary *)info {
     _h = [info[@"h"] unsignedLongLongValue];
@@ -171,6 +172,8 @@ static BOOL isNewFamily(const char *s) {
     return [NSMethodSignature signatureWithObjCTypes:[cached UTF8String]];
 }
 - (BOOL)respondsToSelector:(SEL)sel { return [self methodSignatureForSelector:sel] != nil; }
+// Callers that cache IMPs (RenderBox) must get a guest IMP; forwarding it would hand back the host's x86_64 IMP.
+- (IMP)methodForSelector:(SEL)sel { return (IMP)_objc_msgForward; }
 - (BOOL)isKindOfClass:(Class)c { return [_chain containsObject:NSStringFromClass(c)]; }
 - (BOOL)isMemberOfClass:(Class)c { return [_chain[0] isEqualToString:NSStringFromClass(c)]; }
 - (BOOL)conformsToProtocol:(Protocol *)p { return [_protos containsObject:@(protocol_getName(p))]; }

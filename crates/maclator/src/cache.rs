@@ -71,6 +71,20 @@ pub fn map_and_slide_2(files_count: u32, files: u64, mappings_count: u32, mappin
     }
     let unslid_base = maps[0].address;
     let slide = CACHE_BASE.wrapping_sub(unslid_base);
+    // Reserve the whole span first so the MAP_FIXED maps below land inside our own
+    // allocation. A MAP_FIXED over an unreserved hole trips the VM DEALLOC_GAP guard,
+    // which is fatal once the process is signed (first party).
+    let span = maps.iter().map(|m| m.address.wrapping_add(slide) + m.size).max().unwrap() - CACHE_BASE;
+    unsafe {
+        let r = libc::mmap(CACHE_BASE as *mut _, span as usize, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+        if r != CACHE_BASE as *mut _ {
+            eprintln!("maclator: could not reserve shared cache span {:#x}+{:#x} (got {:p})", CACHE_BASE, span, r);
+            if r != libc::MAP_FAILED {
+                libc::munmap(r, span as usize);
+            }
+            return libc::ENOMEM as i64;
+        }
+    }
     let mut ranges = Vec::new();
     let mut mi = 0usize;
     for f in files {

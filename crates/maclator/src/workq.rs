@@ -586,6 +586,18 @@ fn schedule(st: &mut WlState, wl_id: u64) {
     }
     wl.bound = true;
     if wlog_enabled() { wlog(format!("schedule wl{:x}: deliver n={} (tr={})", wl_id & 0xffffff, n, wl.thread_request.is_some())); }
+    if wlog_enabled() {
+        for i in 0..n {
+            let ev = unsafe { Kev::read(list + i * KEV_SIZE) };
+            if ev.filter == -8 {
+                let mut line = format!("  [rcv] wl{:x} ident={:#x} fflags={:#x} data={:#x} ext0={:#x} ext1={:#x}", wl_id & 0xffffff, ev.ident, ev.fflags, ev.data, ev.ext[0], ev.ext[1]);
+                if ev.ext[0] != 0 {
+                    for j in 0..16 { line.push_str(&format!(" {:08x}", unsafe { *((ev.ext[0] + j * 4) as *const u32) })); }
+                }
+                wlog(line);
+            }
+        }
+    }
     let flags = (flags_for(qos) & !(WQ_FLAG_THREAD_EVENT_MANAGER)) | WQ_FLAG_THREAD_KEVENT | WQ_FLAG_THREAD_WORKLOOP;
     start_job(w, Job { flags, kevent_list: list, nevents: n, stack_top: data_buf + avail, wl: Some(wl_id) });
 }

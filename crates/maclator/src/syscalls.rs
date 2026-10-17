@@ -27,6 +27,7 @@ const SYS_SIGRETURN: u64 = 184;
 const SYS_MMAP: u64 = 197;
 const SYS_MUNMAP: u64 = 73;
 const SYS_SYSCTL: u64 = 202;
+const SYS_PROC_INFO: u64 = 336;
 const SYS_SYSCTLBYNAME: u64 = 274;
 const SYS_SHARED_REGION_CHECK_NP: u64 = 294;
 const SYS_BSDTHREAD_CREATE: u64 = 360;
@@ -112,6 +113,16 @@ fn vpath_join(base: &str, rel: &str) -> String {
     }
 }
 
+/// Host path of an fd the vpath map does not know (seen in a GG boot: dyld's dirfd was unrecorded).
+fn fd_host_path(fd: i32) -> Option<String> {
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
 fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     // Path-taking syscalls: (path arg index, dirfd arg index for *at variants).
     let (pidx, at) = match n {
@@ -130,6 +141,7 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             } else if at {
                 let dfd = args[0] as i32;
                 FD_VPATHS.lock().unwrap().as_ref().and_then(|m| m.get(&dfd).map(|b| vpath_join(b, &orig)))
+                    .or_else(|| fd_host_path(dfd).map(|b| vpath_join(&b, &orig)))
             } else {
                 None
             };
@@ -251,6 +263,23 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
         }
+        SYS_PROC_INFO => {
+            let r = hostsys::unix(n, &args);
+            // proc_pidpath (PIDINFO, PIDPATHINFO) of any process the kernel redirect started names maclator-exec;
+            // answer with the guest program instead, so CF and Launch Services find the app bundle.
+            if !r.carry && args[0] == 2 && args[2] == 11 && args[4] != 0 {
+                let host = cstr_at(args[4]);
+                if host.ends_with("/maclator-exec") {
+                    if let Some(p) = guest_path_of(args[1] as i32).filter(|p| p.len() < args[5] as usize) {
+                        let b = [p.as_bytes(), &[0]].concat();
+                        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), args[4] as *mut u8, b.len()) };
+                        set_ok(cpu, b.len() as u64, 0);
+                        return;
+                    }
+                }
+            }
+            set_res(cpu, r);
+        }
         SYS_SHARED_REGION_CHECK_NP => {
             // -1 (DYLD_VM_END_MWL) marks the end of map_with_linking; 0 just
             // refreshes the task's shared region.
@@ -318,6 +347,39 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
         // host threads we schedule ourselves, and the host kernel rejects some arm64-era
         // priority combinations with EINVAL (libdispatch then aborts), so just accept it.
         478 if args[0] == 0x100 => set_ok(cpu, 0, 0),
+        // __mac_syscall("Sandbox", 0 = set profile): with MCL_NOSANDBOX=1 the profile is
+        // not applied. GG revisiond's sandbox_init gets EINVAL from the host otherwise.
+        381 if std::env::var_os("MCL_NOSANDBOX").is_some()
+            && args[1] == 0
+            && args[0] != 0
+            && unsafe { std::ffi::CStr::from_ptr(args[0] as *const std::ffi::c_char) }.to_bytes() == b"Sandbox" =>
+        {
+            eprintln!("maclator: MCL_NOSANDBOX: sandbox profile skipped");
+            set_ok(cpu, 0, 0)
+        }
+        // __mac_syscall("Sandbox", 0 = set profile) carrying GG's 204-op bytecode: Tahoe's
+        // Sandbox.kext wants 200 ops. GG only inserts 4 ops, so drop their entries and apply
+        // GG's own policy through the host kext.
+        381 if args[1] == 0
+            && args[0] != 0
+            && args[2] != 0
+            && unsafe { std::ffi::CStr::from_ptr(args[0] as *const std::ffi::c_char) }.to_bytes() == b"Sandbox" =>
+        {
+            let a = args[2] as *mut u64; // { bytecode, size, ... }
+            let (bc, len) = unsafe { (*a as *const u8, *a.add(1) as usize) };
+            let orig = unsafe { std::slice::from_raw_parts(bc, len) };
+            match sandbox_204_to_200(orig) {
+                Some(mut v) => unsafe {
+                    *a = v.as_mut_ptr() as u64;
+                    *a.add(1) = v.len() as u64;
+                    let r = hostsys::unix(n, &args);
+                    *a = bc as u64;
+                    *a.add(1) = len as u64;
+                    set_res(cpu, r);
+                },
+                None => set_res(cpu, hostsys::unix(n, &args)),
+            }
+        }
         92 if matches!(args[1], 59 | 61 | 97 | 98 | 103) => {
             // Code-signing fcntls (F_ADDSIGS, F_ADDFILESIGS[_RETURN/_INFO], F_CHECK_LV):
             // the Intel host kernel cannot validate arm64 signatures, so accept them.
@@ -334,9 +396,35 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
         }
         _ => {
             let r = hostsys::unix(n, &args);
-            set_res(cpu, r);
+            // MCL_EPERM_OK=322,...: the host checks entitlements on Maclator, not the
+            // guest, so EPERM from these syscalls is reported as success.
+            if r.carry && r.rax == 1 && std::env::var("MCL_EPERM_OK")
+                .is_ok_and(|v| v.split(',').any(|s| s.trim().parse() == Ok(n)))
+            {
+                eprintln!("maclator: MCL_EPERM_OK: syscall {n} EPERM -> 0");
+                set_ok(cpu, 0, 0);
+            } else {
+                set_res(cpu, r);
+            }
         }
     }
+}
+
+/// GG libsandbox profile bytecode: 16-byte header (u16 op count at +4), then one u16 node
+/// index per op, then position-independent nodes/strings. GG = Tahoe's 200 ops plus
+/// asr-parser-enter, coalition-info, fs-info, isp-command-send at these GG indices.
+fn sandbox_204_to_200(b: &[u8]) -> Option<Vec<u8>> {
+    const GG_ONLY: [usize; 4] = [2, 5, 46, 89];
+    if b.len() < 16 + 2 * 204 || u16::from_le_bytes([b[4], b[5]]) != 204 {
+        return None;
+    }
+    let mut v = b[..16].to_vec();
+    v[4..6].copy_from_slice(&200u16.to_le_bytes());
+    for i in (0..204).filter(|i| !GG_ONLY.contains(i)) {
+        v.extend_from_slice(&b[16 + 2 * i..18 + 2 * i]);
+    }
+    v.extend_from_slice(&b[16 + 2 * 204..]);
+    Some(v)
 }
 
 /// arm64 macOS has 16 KiB pages; the Intel host has 4 KiB. Guest allocators (V8,
@@ -380,6 +468,21 @@ fn mmap_16k(args: &[u64; 8]) -> hostsys::SysResult {
         hostsys::unix(SYS_MUNMAP, &[end, reserve_end - end, 0, 0, 0, 0, 0, 0]);
     }
     r
+}
+
+/// argv[1] of a process started as `maclator-exec <target> ...`, read with KERN_PROCARGS2
+/// (argc, exec path, padding NULs, then argv strings).
+fn guest_path_of(pid: i32) -> Option<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut buf = vec![0u8; 65536];
+    let mut len = buf.len();
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut _, &mut len, std::ptr::null_mut(), 0) } != 0 {
+        return None;
+    }
+    let mut strs = buf[4..len].split(|&c| c == 0).filter(|s| !s.is_empty());
+    strs.next()?; // exec path
+    strs.next()?; // argv[0]
+    String::from_utf8(strs.next()?.to_vec()).ok().filter(|p| p.starts_with('/'))
 }
 
 fn write_sysctl_str(cpu: &mut Cpu, oldp: u64, oldlenp: u64, v: &str) {
@@ -539,7 +642,20 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
             eprintln!("[mach] msg2> bits={:#x} size={} rport={:#x} lport={:#x} id={} opt={:#x}{}", *h, *h.add(1), *h.add(2), *h.add(3), *h.add(5), args[1], strs);
         }
     }
+    // MACH64_MSG_VECTOR: args[0] is a mach_msg_vector_t; the header fields travel in args[2..5].
+    let vec = n == 47 && args[1] & (1 << 32) != 0;
+    if trace && vec {
+        eprintln!("[mach] [vec] bits={:#x} size={} rport={:#x} lport={:#x} id={:#x} opt={:#x}", args[2] as u32, args[2] >> 32, args[3] as u32, args[3] >> 32, args[4] >> 32, args[1]);
+    }
     let r = hostsys::mach(n, &args);
+    if trace && n == 47 && args[0] != 0 && args[1] & 2 != 0 && r.rax == 0 {
+        // MACH64_RCV_MSG: dump the received header and body start.
+        let buf = if vec { unsafe { let ra = *((args[0] + 8) as *const u64); if ra != 0 { ra } else { *(args[0] as *const u64) } } } else { args[0] };
+        if buf != 0 {
+            let w: Vec<String> = (0..16).map(|i| format!("{:08x}", unsafe { *((buf + i * 4) as *const u32) })).collect();
+            eprintln!("[mach] [rcv] {}", w.join(" "));
+        }
+    }
     if n == 47 && args[0] != 0 {
         let reply_id = unsafe { *((args[0] + 20) as *const u32) };
         let retcode = unsafe { *((args[0] + 32) as *const u32) };
@@ -555,6 +671,28 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
         // we already run in the interpreter/JIT, so pretend it worked.
         if req_id == 8000 && reply_id == req_id + 100 && retcode == 46 {
             unsafe { *((args[0] + 32) as *mut u32) = 0 };
+        }
+        // SkyLight display state (34003 -> 34103, one OOL blob): GG's parser reads a flag byte at 0x20 that
+        // Tahoe's WindowServer does not write. Insert a 0 there (flag false: GG then skips its optional 16-byte
+        // field). The rest of the stream is identical: per-display and per-mode fields are version-gated and
+        // Tahoe sends display v3 / mode v4, below GG's new v5+ fields (skl/record-map-output.txt).
+        // GG rejects the reply unless the descriptor size (+0x28) equals the MIG count (+0x34): update both.
+        // ponytail: relies on page slack; a blob ending exactly on a page boundary is left as-is (GG sees 0
+        // displays), allocate a bigger region if that ever happens.
+        if req_id == 34003 && reply_id == 34103 && std::env::var_os("MCL_DS_FLAG").is_some() {
+            unsafe {
+                let addr = *((args[0] + 28) as *const u64) as *mut u8;
+                let sizep = (args[0] + 40) as *mut u32;
+                let size = *sizep as usize;
+                if trace { eprintln!("[mach] 34103 blob {:p} size {:#x}", addr, size); }
+                if !addr.is_null() && size > 0x20 && size % 0x1000 != 0 {
+                    std::ptr::copy(addr.add(0x20), addr.add(0x21), size - 0x20);
+                    *addr.add(0x20) = 0;
+                    *sizep = (size + 1) as u32;
+                    *((args[0] + 52) as *mut u32) = (size + 1) as u32;
+                    if trace { let b = std::slice::from_raw_parts(addr, 0x40); eprintln!("[mach] 34103 head {:02x?}", b); }
+                }
+            }
         }
     }
     if trace {
