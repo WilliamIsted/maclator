@@ -648,17 +648,29 @@ fn wl_apply(st: &mut WlState, wl_id: u64, ke: &Kev) -> i64 {
     let mut err: i64 = 0;
     let mut new_owner = wl.owner;
     if addr != 0 {
-        match crate::guestmem::read_u64(addr) {
-            None => return libc::EFAULT as i64,
-            Some(cur) => {
-                if cur & mask != value & mask {
-                    err = libc::ESTALE as i64;
-                } else if ff & NOTE_WL_DISCOVER_OWNER != 0 {
-                    let name = (cur as u32 & !3) as u64;
-                    if name != 0 {
-                        new_owner = name;
-                    }
-                }
+        // `addr` is libdispatch's debounce/owner word (&dq_state of the target
+        // queue). It lives in libdispatch's object zone, which every VM
+        // introspection API on this host misreports: mach_vm_read_overwrite and
+        // mach_vm_region both return KERN_INVALID_ADDRESS and mincore returns
+        // EPERM, even though the page is mapped and directly readable (the JIT
+        // reads guest memory this way too). So read_u64 (mach_vm_read based)
+        // yields a false None here. Returning EFAULT then makes the code below
+        // deliver an EV_ERROR(EFAULT) event, and libdispatch treats EFAULT from
+        // kevent as fatal ("BUG IN LIBDISPATCH: Unexpected error from kevent").
+        // Fall back to a direct load. ponytail: no fault protection on the
+        // fallback — a genuinely bad debounce addr never reaches here for
+        // correct libdispatch, and on real XNU it would crash libdispatch too;
+        // add a sigsetjmp-protected read if a bad addr ever does.
+        let cur = match crate::guestmem::read_u64(addr) {
+            Some(v) => v,
+            None => unsafe { std::ptr::read_volatile(addr as *const u64) },
+        };
+        if cur & mask != value & mask {
+            err = libc::ESTALE as i64;
+        } else if ff & NOTE_WL_DISCOVER_OWNER != 0 {
+            let name = (cur as u32 & !3) as u64;
+            if name != 0 {
+                new_owner = name;
             }
         }
     }
