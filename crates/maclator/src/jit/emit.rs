@@ -1700,6 +1700,17 @@ impl<'a> E<'a> {
                 a!(self, mov(qword_ptr(r15 + off::TPIDR), rax));
                 return true;
             }
+            0xD50B_7420 => {
+                // DC ZVA: zero the 64-byte block inline. Exiting to the interpreter cost a dispatch
+                // per 64 bytes in bzero's large-size loop (boot 268, WindowManager at 100% CPU).
+                self.ldx(rax, insn & 31, false);
+                a!(self, and(rax, -64i32));
+                a!(self, pxor(xmm0, xmm0));
+                for i in 0..4 {
+                    a!(self, movdqu(xmmword_ptr(rax + i * 16), xmm0));
+                }
+                return true;
+            }
             _ => {}
         }
         false

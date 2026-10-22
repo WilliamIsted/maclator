@@ -16,7 +16,7 @@
 use crate::hostsys;
 use maclator_core::cpu::Cpu;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Condvar, Mutex, Once};
 
@@ -132,12 +132,27 @@ impl Kev {
 fn host_kqueue() -> i32 {
     let r = hostsys::unix(SYS_KQUEUE, &[0; 8]);
     let fd = r.rax as i32;
-    // Move it out of the guest's usual descriptor range.
+    if r.carry || fd < 0 {
+        eprintln!("[maclator] kqueue failed errno={}", r.rax);
+        return -1;
+    }
+    // Move it out of the guest's usual descriptor range. Boot 272: the dup to 900 failed in WindowManager and its
+    // kqueue stayed on fd 1, which the guest later reused. Fall back under the soft fd limit, and never keep 0-2.
     unsafe {
-        let high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 900);
-        if high >= 0 {
-            libc::close(fd);
-            return high;
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        let cur = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 { lim.rlim_cur.min(i32::MAX as u64) as i32 } else { 256 };
+        for target in [900, cur - 64, cur / 2, 3] {
+            if target < 3 {
+                continue;
+            }
+            let high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, target);
+            if high >= 0 {
+                libc::close(fd);
+                return high;
+            }
+            if target == 900 {
+                eprintln!("[maclator] kqueue fd {} dup to 900 failed errno={} nofile={}", fd, *libc::__error(), cur);
+            }
         }
     }
     fd
@@ -497,6 +512,8 @@ static WL: Mutex<Option<WlState>> = Mutex::new(None);
 static WL_CV: Condvar = Condvar::new();
 static WL_MON_KQ: AtomicI32 = AtomicI32::new(-1);
 static WL_MONITOR: Once = Once::new();
+static EMPTY_DRAINS: AtomicU64 = AtomicU64::new(0);
+static LAST_MON_DATA: AtomicU64 = AtomicU64::new(0);
 
 fn with_wl<R>(f: impl FnOnce(&mut WlState) -> R) -> R {
     let mut g = WL.lock().unwrap();
@@ -530,6 +547,7 @@ fn wl_monitor() {
                 if let Some(wl) = st.loops.get_mut(&wl_id) {
                     wl.needs_service = true;
                 }
+                LAST_MON_DATA.store(ev.data as u64, Ordering::Relaxed);
                 schedule(st, wl_id);
             }
         }
@@ -567,8 +585,10 @@ fn schedule(st: &mut WlState, wl_id: u64) {
     unsafe { *((list - 8) as *mut u64) = wl_id };
     let data_buf = w.data_buf();
     let mut avail: u64 = WQ_KEVENT_DATA_SIZE - 8;
+    let mut drain = (false, 0u64);
     if wl.kq >= 0 {
         let r = kevent_qos(wl.kq, 0, 0, list + n * KEV_SIZE, WQ_KEVENT_LIST_LEN - n, data_buf, &mut avail as *mut u64 as u64, KEVENT_FLAG_STACK_DATA | KEVENT_FLAG_IMMEDIATE);
+        drain = (r.carry, r.rax);
         if !r.carry {
             if n == 0 && r.rax > 0 {
                 qos = unsafe { Kev::read(list) }.qos as u32 as u64;
@@ -578,6 +598,11 @@ fn schedule(st: &mut WlState, wl_id: u64) {
     }
     wl.needs_service = false;
     if n == 0 {
+        // Boot 271 sampled wl_monitor at 100% CPU cycling through here.
+        let c = EMPTY_DRAINS.fetch_add(1, Ordering::Relaxed);
+        if c < 20 || c % 100_000 == 0 {
+            eprintln!("[wlspin] #{c} wl{:x} kq={} drain carry={} rax={:#x} mon.data={}", wl_id & 0xffffff, wl.kq, drain.0, drain.1, LAST_MON_DATA.load(Ordering::Relaxed));
+        }
         IDLE.lock().unwrap().push(w);
         if wl.kq >= 0 {
             watch_wl_kq(wl.kq, wl_id, false);

@@ -50,8 +50,10 @@ fn cache_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("MACLATOR_CACHE") {
         return d.into();
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::Path::new(&home).join("Library/Caches/Maclator/aot")
+    // One persistent cache for every translated process, like /var/db/oah.
+    // ponytail: world-writable sticky dir; a uid cannot replace another uid's files, so updates
+    // from user apps to root-written files are skipped. Per-uid ownership if that matters.
+    "/private/var/db/maclator/aot".into()
 }
 
 fn hex(b: &[u8]) -> String {
@@ -305,7 +307,11 @@ pub fn save_profile() {
     flush_pending();
     let imgs = IMAGES.lock().unwrap().clone();
     let seen = SEEN.lock().unwrap().clone();
-    let _ = std::fs::create_dir_all(cache_dir());
+    let dir = cache_dir();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
+    }
     let mut rebuild = Vec::new();
     for (i, img) in imgs.iter().enumerate() {
         let path = file_for(img, "profile");
@@ -318,7 +324,12 @@ pub fn save_profile() {
             for pc in &prof {
                 buf.extend_from_slice(&pc.to_le_bytes());
             }
-            let _ = std::fs::write(&path, buf);
+            let tmp = path.with_extension(format!("profile.tmp{}", std::process::id()));
+            if std::fs::write(&tmp, buf).is_ok() {
+                if std::fs::rename(&tmp, &path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
             rebuild.push((img.clone(), prof));
         }
     }
@@ -341,8 +352,22 @@ pub fn save_profile() {
             libc::dup2(null, 2);
         }
     }
+    // Many processes save at once; one rebuild per image at a time. A lock older than
+    // ten minutes is from a killed rebuild and is taken over.
     for (img, prof) in rebuild {
+        let lock = file_for(&img, "lock");
+        let stale = std::fs::metadata(&lock)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|e| e.as_secs() > 600).unwrap_or(false))
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(&lock);
+        }
+        if std::fs::OpenOptions::new().write(true).create_new(true).open(&lock).is_err() {
+            continue;
+        }
         let _ = build(&img, &prof);
+        let _ = std::fs::remove_file(&lock);
     }
     if !sync {
         unsafe { libc::_exit(0) };
@@ -438,7 +463,7 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
         }
     }
     let path = file_for(img, "aot");
-    let tmp = path.with_extension("aot.tmp");
+    let tmp = path.with_extension(format!("aot.tmp{}", std::process::id()));
     let mut f = std::fs::File::create(&tmp)?;
     let mut hdr = Vec::new();
     hdr.extend_from_slice(MAGIC);
@@ -456,7 +481,10 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
     f.write_all(&hdr)?;
     f.write_all(&code)?;
     drop(f);
-    std::fs::rename(tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 

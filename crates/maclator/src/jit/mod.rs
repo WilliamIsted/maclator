@@ -127,6 +127,9 @@ thread_local! {
     static PENDING: Cell<Option<Exit>> = const { Cell::new(None) };
     static IBTC: RefCell<Option<Box<[[u64; 2]]>>> = const { RefCell::new(None) };
     static MY_EPOCH: Cell<u64> = const { Cell::new(0) };
+    // Page of a hot entry the interpreter has just run. mach_vm_read misreports some mapped GG
+    // code as unreadable (see workq.rs), so the translator reads this page directly.
+    static TRUSTED_PAGE: Cell<u64> = const { Cell::new(u64::MAX) };
 }
 
 pub fn code_cache() -> &'static CodeCache {
@@ -252,7 +255,15 @@ fn emit_unit(pc: u64, slot_padding: usize) -> Unit {
     u.no_internal_jumps = verify_mode();
     let l = u.a.create_label();
     u.labels.insert(pc, l);
-    let read = guest_reader();
+    let checked = guest_reader();
+    let trusted = TRUSTED_PAGE.with(|t| t.get());
+    let read = move |a: u64| {
+        if a & !0xfff == trusted {
+            Some(unsafe { std::ptr::read_unaligned(a as *const u32) })
+        } else {
+            checked(a)
+        }
+    };
     emit::emit_block(&mut u, pc, &read);
     u.finish();
     u
@@ -632,7 +643,10 @@ pub fn run(cpu: &mut Cpu) {
                     }
                     continue;
                 }
-                translate(pc)
+                TRUSTED_PAGE.with(|t| t.set(pc & !0xfff));
+                let h = translate(pc);
+                TRUSTED_PAGE.with(|t| t.set(u64::MAX));
+                h
             }
         };
         STATS_JIT_ENTRIES.fetch_add(1, Ordering::Relaxed);
@@ -647,8 +661,18 @@ pub fn run(cpu: &mut Cpu) {
                 let slot = cpu.exit_data;
                 if slot != 0 && !verify_mode() {
                     // Chain: point the exit slot straight at the target block.
-                    let target = lookup_or_translate(cpu.pc);
-                    chain_slot(slot, cpu.pc, target);
+                    // A target the interpreter has run is readable even when mach_vm_read says
+                    // otherwise; untrusted, it would translate to a stub that exits to itself.
+                    // A target it has not run is left unchained: the loop tiers it like any cold pc.
+                    // Boot 270: a target already in the cache (AOT, or built by another thread) is chained
+                    // too; HOT is per-thread, so it alone left those exits unchained for good.
+                    let ran = lookup(cpu.pc).is_some() || HOT.with(|h| h.borrow().contains_key(&cpu.pc));
+                    if ran {
+                        TRUSTED_PAGE.with(|t| t.set(cpu.pc & !0xfff));
+                        let target = lookup_or_translate(cpu.pc);
+                        TRUSTED_PAGE.with(|t| t.set(u64::MAX));
+                        chain_slot(slot, cpu.pc, target);
+                    }
                 }
             }
             EXIT_SVC => {

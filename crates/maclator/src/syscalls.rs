@@ -44,6 +44,40 @@ const PROT_EXEC: u64 = 4;
 const MAP_JIT: u64 = 0x800;
 
 #[inline]
+/// Names for MIG RetCodes seen in replies: MIG errors, the common kern_return_t values, and CGError (SkyLight).
+fn mig_err_name(rc: i32) -> &'static str {
+    match rc {
+        0 => "KERN_SUCCESS",
+        1 => "KERN_INVALID_ADDRESS",
+        2 => "KERN_PROTECTION_FAILURE",
+        4 => "KERN_INVALID_ARGUMENT",
+        5 => "KERN_FAILURE",
+        6 => "KERN_RESOURCE_SHORTAGE",
+        15 => "KERN_INVALID_NAME",
+        17 => "KERN_INVALID_RIGHT",
+        46 => "KERN_NOT_SUPPORTED",
+        -300 => "MIG_TYPE_ERROR",
+        -301 => "MIG_REPLY_MISMATCH",
+        -302 => "MIG_REMOTE_ERROR",
+        -303 => "MIG_BAD_ID",
+        -304 => "MIG_BAD_ARGUMENTS",
+        -305 => "MIG_NO_REPLY",
+        -307 => "MIG_ARRAY_TOO_LARGE",
+        -308 => "MIG_SERVER_DIED",
+        1000 => "kCGErrorFailure",
+        1001 => "kCGErrorIllegalArgument",
+        1002 => "kCGErrorInvalidConnection",
+        1003 => "kCGErrorInvalidContext",
+        1004 => "kCGErrorCannotComplete",
+        1006 => "kCGErrorNotImplemented",
+        1007 => "kCGErrorRangeCheck",
+        1008 => "kCGErrorTypeCheck",
+        1010 => "kCGErrorInvalidOperation",
+        1011 => "kCGErrorNoneAvailable",
+        _ => "?",
+    }
+}
+
 fn set_ok(cpu: &mut Cpu, r0: u64, r1: u64) {
     cpu.x[0] = r0;
     cpu.x[1] = r1;
@@ -93,11 +127,11 @@ pub fn handle_svc(cpu: &mut Cpu) {
     }
     let trace = TRACE.load(Ordering::Relaxed);
     if trace {
-        eprintln!("[sys] {}#{}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) pc={:#x}", syscall_name(n), n, args[0], args[1], args[2], args[3], args[4], args[5], cpu.pc - 4);
+        eprintln!("[sys] t={} {}#{}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) pc={:#x}", trace_tid(), syscall_name(n), n, args[0], args[1], args[2], args[3], args[4], args[5], cpu.pc - 4);
     }
     bsd(cpu, n, args);
     if trace {
-        eprintln!("[sys]   -> {}{:#x}", if cpu.cf != 0 { "ERR " } else { "" }, cpu.x[0]);
+        eprintln!("[sys]   t={} -> {}{:#x}", trace_tid(), if cpu.cf != 0 { "ERR " } else { "" }, cpu.x[0]);
     }
 }
 
@@ -647,6 +681,9 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
     if trace && vec {
         eprintln!("[mach] [vec] bits={:#x} size={} rport={:#x} lport={:#x} id={:#x} opt={:#x}", args[2] as u32, args[2] >> 32, args[3] as u32, args[3] >> 32, args[4] >> 32, args[1]);
     }
+    if trace {
+        eprintln!("[mach] t={} enter {}({:#x}, {:#x}, {:#x}, {:#x}) pc={:#x}", trace_tid(), n, args[0], args[1], args[2], args[3], cpu.pc - 4);
+    }
     let r = hostsys::mach(n, &args);
     if trace && n == 47 && args[0] != 0 && args[1] & 2 != 0 && r.rax == 0 {
         // MACH64_RCV_MSG: dump the received header and body start.
@@ -654,6 +691,17 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
         if buf != 0 {
             let w: Vec<String> = (0..16).map(|i| format!("{:08x}", unsafe { *((buf + i * 4) as *const u32) })).collect();
             eprintln!("[mach] [rcv] {}", w.join(" "));
+            // MIG reply decode: a simple reply with id = request + 100 carries NDR at +24 and RetCode at +32.
+            // Complex replies carry no RetCode (success with descriptors). Greppable as "[mig]".
+            let (bits, size, id) = unsafe { (*(buf as *const u32), *((buf + 4) as *const u32), *((buf + 20) as *const u32)) };
+            if req_id != 0 && id == req_id.wrapping_add(100) {
+                if bits & 0x8000_0000 != 0 {
+                    eprintln!("[mig] reply {req_id}->{id} complex size={size} ok");
+                } else if size >= 36 {
+                    let rc = unsafe { *((buf + 32) as *const i32) };
+                    eprintln!("[mig] reply {req_id}->{id} size={size} ret={rc} {}{}", mig_err_name(rc), if rc != 0 { " ERR" } else { "" });
+                }
+            }
         }
     }
     if n == 47 && args[0] != 0 {
@@ -696,7 +744,7 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
         }
     }
     if trace {
-        eprintln!("[mach] trap {}({:#x}, {:#x}, {:#x}, {:#x}) -> {:#x}", n, args[0], args[1], args[2], args[3], r.rax);
+        eprintln!("[mach] t={} trap {}({:#x}, {:#x}, {:#x}, {:#x}) -> {:#x}", trace_tid(), n, args[0], args[1], args[2], args[3], r.rax);
     }
     cpu.x[0] = r.rax;
 }
@@ -761,4 +809,11 @@ pub fn syscall_name(n: u64) -> &'static str {
         550 => "map_with_linking_np",
         _ => "?",
     }
+}
+
+// Host thread id for trace lines, so a blocked guest thread's last entry can be found.
+fn trace_tid() -> u64 {
+    let mut t = 0u64;
+    unsafe { libc::pthread_threadid_np(0 as libc::pthread_t, &mut t) };
+    t
 }

@@ -10,6 +10,7 @@ mod hostsys;
 mod iokit;
 mod jit;
 mod loader;
+mod lsreg;
 mod macho;
 mod paths;
 mod signals;
@@ -44,6 +45,9 @@ fn main() {
             args.remove(0);
         }
         AUTO.store(true, Ordering::Relaxed);
+        if let Some(t) = args.first() {
+            check_deny(&conf_path(), t);
+        }
         // Config options go first, so flags that spawn.rs forwards to re-launched children override them.
         let mut opts = auto_options(&conf_path());
         opts.append(&mut args);
@@ -132,6 +136,20 @@ fn main() {
                 aot::set_enabled(false);
                 jit::selftest::run_selftest(&class, n);
                 std::process::exit(0);
+            }
+            "--selftest-lsreg" => {
+                // Check this process in to LaunchServices as the .app containing the given
+                // executable, then stay alive for `lsappinfo info -app <id>` to inspect.
+                args.remove(0);
+                if args.is_empty() {
+                    usage();
+                }
+                let exe = resolve_path(&args.remove(0));
+                lsreg::register_app(&exe);
+                eprintln!("maclator: lsreg selftest: pid {} checked in for {exe}", unsafe { libc::getpid() });
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                }
             }
             "-h" | "--help" => usage(),
             _ => break,
@@ -237,6 +255,21 @@ fn main() {
         let (lo, hi) = d.vm_range();
         aot::register_dyld(&dyld, d.uuid, lo.wrapping_add(loaded.dyld.slide), hi.wrapping_add(loaded.dyld.slide));
     }
+    // GUI guests often never exit cleanly (killed, or quit times out), so the exit-time
+    // profile save never runs. MACLATOR_AOT_SAVE_AFTER=<secs> saves once after that long
+    // (default 60, 0 turns it off).
+    let save_after = std::env::var("MACLATOR_AOT_SAVE_AFTER").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(60);
+    if let Some(s) = Some(save_after).filter(|&s| s > 0) {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(s));
+            eprintln!("[maclator] aot: timed profile save after {s}s");
+            aot::save_profile();
+            eprintln!("[maclator] aot: timed profile save done");
+        });
+    }
+    // A guest GUI app launched via the exec redirect is seen by host LaunchServices
+    // as maclator-exec; check this pid in under the guest .app so FuseBoard resolves it.
+    lsreg::register_app(&exe);
     engine::run_thread(&mut cpu);
     // The main thread ended (pthread_exit on main): wait for other threads.
     while threads::LIVE_THREADS.load(Ordering::SeqCst) > 1 {
@@ -279,6 +312,7 @@ fn auto_options(conf: &str) -> Vec<String> {
                 }
             }
             "mount" => mount = Some(v.to_string()),
+            "deny" | "allow" => {} // read by check_deny
             _ if k.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
                 if std::env::var_os(k).is_none() {
                     std::env::set_var(k, v);
@@ -297,6 +331,23 @@ fn auto_options(conf: &str) -> Vec<String> {
         opts.extend(["--sysroot".to_string(), s]);
     }
     opts
+}
+
+/// Refuse targets under a `deny=` path prefix unless an `allow=` prefix also matches (both
+/// repeatable), so a manual boot can keep apps from running translated while daemons still do.
+fn check_deny(conf: &str, target: &str) {
+    let Ok(text) = std::fs::read_to_string(conf) else { return };
+    let (mut deny, mut allow) = (false, false);
+    for line in text.lines().map(str::trim) {
+        match line.split_once('=') {
+            Some(("deny", v)) if target.starts_with(v.trim()) => deny = true,
+            Some(("allow", v)) if target.starts_with(v.trim()) => allow = true,
+            _ => {}
+        }
+    }
+    if deny && !allow {
+        fail(&format!("{target}: denied by {conf}"));
+    }
 }
 
 /// Mount the kit volume read-only at `mp` until `want` appears: GG's diskutil cannot find it by
