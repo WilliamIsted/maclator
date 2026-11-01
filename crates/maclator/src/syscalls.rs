@@ -399,6 +399,7 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             && args[2] != 0
             && unsafe { std::ffi::CStr::from_ptr(args[0] as *const std::ffi::c_char) }.to_bytes() == b"Sandbox" =>
         {
+            crate::workq::fill_kqueue_pool();
             let a = args[2] as *mut u64; // { bytecode, size, ... }
             let (bc, len) = unsafe { (*a as *const u8, *a.add(1) as usize) };
             let orig = unsafe { std::slice::from_raw_parts(bc, len) };

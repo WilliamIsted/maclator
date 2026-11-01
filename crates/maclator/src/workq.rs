@@ -16,7 +16,7 @@
 use crate::hostsys;
 use maclator_core::cpu::Cpu;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Condvar, Mutex, Once};
 
@@ -129,7 +129,54 @@ impl Kev {
     }
 }
 
+/// kqueues opened before the guest's sandbox profile goes on. Golden Gate's WindowManager.sb allows kevent_qos but
+/// not kqueue(), which arm64 libdispatch never calls: it uses kernel workloops, which we back with host kqueues.
+/// Boot of 2026-11-01 10:47: 562 EPERMs, 281 workloops never got their knotes, each failure surfacing as EBADF.
+/// ponytail: 1024 for WindowManager and workloops never give theirs back. When it runs dry kqueue fails as before;
+/// recycle a workloop's kqueue once its knotes are deleted if a guest gets there.
+static KQ_POOL: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+const KQ_POOL_SIZE: usize = 1024;
+/// The one guest that gets the pool. No other guest's descriptors or file limit change.
+const KQ_POOL_TARGET: &str = "/System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager";
+static KQ_POOL_WANTED: AtomicBool = AtomicBool::new(false);
+
+/// `exe` is main's resolved target. Every re-exec runs main again, so it is decided afresh for each program.
+pub fn set_kqueue_pool_target(exe: &str) {
+    KQ_POOL_WANTED.store(exe == KQ_POOL_TARGET, Ordering::Relaxed);
+}
+
+/// Call just before applying a guest's sandbox profile.
+pub fn fill_kqueue_pool() {
+    if !KQ_POOL_WANTED.load(Ordering::Relaxed) {
+        return;
+    }
+    // The pool and the dup to 900 need room: launchd hands agents a soft limit of 256.
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < 4096 {
+            lim.rlim_cur = lim.rlim_max.min(4096);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
+    let mut pool = KQ_POOL.lock().unwrap();
+    while pool.len() < KQ_POOL_SIZE {
+        let fd = open_kqueue();
+        if fd < 0 {
+            break;
+        }
+        pool.push(fd);
+    }
+}
+
 fn host_kqueue() -> i32 {
+    // Pool first: once a profile is on, a refused kqueue() also costs a sandbox denial report.
+    if let Some(fd) = KQ_POOL.lock().unwrap().pop() {
+        return fd;
+    }
+    open_kqueue()
+}
+
+fn open_kqueue() -> i32 {
     let r = hostsys::unix(SYS_KQUEUE, &[0; 8]);
     let fd = r.rax as i32;
     if r.carry || fd < 0 {

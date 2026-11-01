@@ -200,6 +200,7 @@ fn main() {
         syscalls::TRACE.store(true, Ordering::Relaxed);
     }
     let exe = resolve_path(&args[0]);
+    workq::set_kqueue_pool_target(&exe);
     let gpu_active = std::env::var_os("MACLATOR_GPU").is_some()
         && std::env::var("MACLATOR_GPU_ONLY").map(|o| args.iter().skip(1).any(|a| a.contains(&o))).unwrap_or(true);
     let mut envp: Vec<String> = std::env::vars()
