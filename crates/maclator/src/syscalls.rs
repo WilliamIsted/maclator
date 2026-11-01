@@ -486,7 +486,11 @@ fn mmap_16k(args: &[u64; 8]) -> hostsys::SysResult {
     a[0] = aligned;
     a[1] = len16;
     a[3] = flags | MAP_FIXED;
-    let _ = fd;
+    // POSIX shm cannot be mapped past its size (libnotify's 4 KiB page gave EINVAL, native triage 21 Oct), so
+    // map an fd at its real length and leave the rest of the 16 KiB window reserved.
+    if flags & MAP_ANON == 0 && fd >= 0 {
+        a[1] = len;
+    }
     let r = hostsys::unix(SYS_MMAP, &a);
     if r.carry {
         hostsys::unix(SYS_MUNMAP, &[base, len16 + PAGE, 0, 0, 0, 0, 0, 0]);

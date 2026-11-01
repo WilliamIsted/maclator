@@ -206,6 +206,9 @@ fn main() {
         .filter(|(k, _)| !k.starts_with("MACLATOR_") || matches!(k.as_str(), "MACLATOR_DUMP_ON_FAULT" | "MACLATOR_GPU_BRIDGE" | "MACLATOR_JIT_THRESHOLD" | "MACLATOR_STATS" | "MACLATOR_FALLBACK_HIST"))
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
+    if std::env::var_os("MACLATOR_XPC_FLAGS").is_some() {
+        restore_xpc_flags(&mut envp);
+    }
 
     if gpu_active && !gpu::inject(&mut envp) {
         eprintln!("maclator: --gpu: libmclmetal.dylib not found (looked next to maclator, in ./gpu, ~/.maclator/gpu, $MACLATOR_GPU_DIR)");
@@ -280,6 +283,26 @@ fn main() {
 
 /// Set in auto mode: failures go to syslog too and exit 126.
 static AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Host libxpc in maclator-exec rewrites XPC_FLAGS before main runs, so the guest's libxpc would read 0 and
+/// think launchd did not start it. Put back the kernel-built value from KERN_PROCARGS2. Opt-in
+/// (MACLATOR_XPC_FLAGS) because it marks every launchd-started translated process as managed.
+fn restore_xpc_flags(envp: &mut Vec<String>) {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, unsafe { libc::getpid() }];
+    let mut len: libc::size_t = 0;
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) } != 0 { return; }
+    let mut buf = vec![0u8; len];
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } != 0 { return; }
+    buf.truncate(len);
+    if buf.len() < 4 { return; }
+    // Layout: int argc, exec path, NUL padding, argc args, then the environment.
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
+    let mut it = buf[4..].split(|&b| b == 0).filter(|s| !s.is_empty()).skip(1 + argc);
+    let Some(val) = it.find(|s| s.starts_with(b"XPC_FLAGS=")) else { return };
+    let Ok(val) = std::str::from_utf8(val) else { return };
+    envp.retain(|e| !e.starts_with("XPC_FLAGS="));
+    envp.push(val.to_string());
+}
 
 fn conf_path() -> String {
     std::env::var("MACLATOR_CONF").unwrap_or_else(|_| "/usr/local/etc/maclator.conf".to_string())

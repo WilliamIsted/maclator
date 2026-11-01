@@ -694,7 +694,7 @@ pub fn is_terminator(insn: u32) -> bool {
         || (insn & 0x7E00_0000 == 0x3600_0000)   // TBZ/TBNZ
         || (insn & 0xFE00_0000 == 0xD600_0000)   // BR/BLR/RET(+PAC)
         || (insn & 0xFF00_0000 == 0xD400_0000)   // exceptions (SVC, BRK...)
-        || (insn & 0xFFF8_F0E0 == 0xD508_7020)   // IC IVAU (runtime must see it)
+        || (insn & 0xFFFF_FFE0 == 0xD50B_7520)   // IC IVAU only (the old mask also hit DC ZVA)
 }
 
 /// Translate one basic block starting at `pc` into `u`. The caller must have
