@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <stdatomic.h>
 #include <mach/mach_time.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include "mclproto.h"
 
 #ifdef MCL_LOOPBACK
@@ -119,6 +120,8 @@ static NSMutableDictionary *gSigCache;
 static NSLock *gSigLock;
 
 static BOOL isNewFamily(const char *s) {
+    // Not new-family by name, but returns +1 (IOAccelGLDrawableLookupIOSurfaceFromIndex -> IOSurfaceLookupFromMachPort).
+    if (strcmp(s, "lookupIOSurfaceAtIndex:") == 0) return YES;
     while (*s == '_') s++;
     static const char *fam[] = {"new", "alloc", "copy", "mutableCopy"};
     for (int i = 0; i < 4; i++) {
@@ -193,7 +196,7 @@ extern void _objc_msgForward(void);
     if (gStats) legacy_note(sel);
     NSMethodSignature *sig = inv.methodSignature;
     NSMutableArray *args = [NSMutableArray array];
-    NSError **errOut = NULL;
+    id *outs[8]; int nOut = 0;   // object out-parameters (error:, reflection:, ...) in argument order
     NSString *selName = @(sel_getName(sel));
     NSArray *parts = [selName componentsSeparatedByString:@":"];
     for (NSUInteger i = 2; i < sig.numberOfArguments; i++) {
@@ -215,8 +218,8 @@ extern void _objc_msgForward(void);
                 for (NSUInteger k = 0; k < count && ptr; k++) [ids addObject:encodeObject(((id *)ptr)[k])];
                 [args addObject:@{@"ids": ids}];
             } else {
-                errOut = (NSError **)ptr;
-                [args addObject:@{@"outerr": @YES}];
+                if (ptr && nOut < 8) { outs[nOut++] = (id *)ptr; [args addObject:@{@"outerr": @YES}]; }
+                else [args addObject:NILV()];
             }
         } else if (strncmp(b, "^{__IOSurface", 13) == 0) {
             // IOSurfaceRef is a guest-side CF object; the host looks the surface up by its global id.
@@ -236,14 +239,12 @@ extern void _objc_msgForward(void);
     if (reply[@"x"]) {
         [NSException raise:@"MCLRemoteException" format:@"%@", reply[@"x"]];
     }
-    if (errOut && reply[@"err"]) {
-        NSDictionary *e = reply[@"err"][@"e"];
-        *errOut = [NSError errorWithDomain:e[@"d"] code:[e[@"k"] integerValue] userInfo:@{NSLocalizedDescriptionKey: e[@"m"] ?: @""}];
-    }
+    NSArray *outv = reply[@"outs"];
+    for (int k = 0; k < nOut; k++) *outs[k] = k < (int)outv.count ? decode(outv[k], NO) : nil;   // +0: NSError, proxy or nil
     const char *rt = skipQualifiers([sig methodReturnType]);
     if (rt[0] == 'v') return;
     id r = reply[@"r"];
-    if (rt[0] == '@') {
+    if (rt[0] == '@' || strncmp(rt, "^{__IOSurface", 13) == 0) {
         BOOL nw = isNewFamily(sel_getName(sel));
         if ([r isKindOfClass:[NSDictionary class]] && r[@"h"] && r[@"i"]) fastNoteResultClass(sel, [r[@"i"] unsignedIntValue]);
         id o = decode(r, nw);
@@ -261,9 +262,52 @@ extern void _objc_msgForward(void);
 
 
 // ---- descriptors: serialize guest-side MTL*Descriptor objects by introspection -----------
+// MTLFunctionConstantValues keeps its values in private storage, not properties: as a descriptor it arrived empty.
+static BOOL isConstantValues(id o) {
+    static Class c;
+    if (!c) c = objc_getClass("MTLFunctionConstantValues");
+    return c && [o isKindOfClass:c];
+}
+
 static BOOL isDescriptorClass(id o) {
     const char *n = object_getClassName(o);
-    return strncmp(n, "MTL", 3) == 0 || strncmp(n, "CAMetal", 7) == 0;
+    return (strncmp(n, "MTL", 3) == 0 || strncmp(n, "CAMetal", 7) == 0) && !isConstantValues(o);
+}
+
+// Bytes of one function constant of MTLDataType t (3-component vectors take 4 slots); 0 = unknown.
+static NSUInteger constantSize(NSUInteger t) {
+    static const NSUInteger n[4] = {1, 2, 4, 4};
+    if (t >= 3 && t <= 6) return 4 * n[t - 3];        // float
+    if (t >= 16 && t <= 19) return 2 * n[t - 16];     // half
+    if (t >= 29 && t <= 36) return 4 * n[(t - 29) % 4];   // int, uint
+    if (t >= 37 && t <= 44) return 2 * n[(t - 37) % 4];   // short, ushort
+    if (t >= 45 && t <= 56) return n[(t - 45) % 4];       // char, uchar, bool
+    if (t >= 81 && t <= 88) return 8 * n[(t - 81) % 4];   // long, ulong
+    if (t >= 121 && t <= 124) return 2 * n[t - 121];  // bfloat
+    return 0;
+}
+
+// Each constant as [index or name, MTLDataType, bytes], read through Metal's own (private) enumerators.
+static id encodeConstants(id o) {
+    NSMutableArray *a = [NSMutableArray array];
+    const char *lists[2] = {"newIndexedConstantArray", "newNamedConstantArray"};
+    for (int k = 0; k < 2; k++) {
+        SEL s = sel_registerName(lists[k]);
+        if (![o respondsToSelector:s]) { fprintf(stderr, "[mclmetal] %s missing: function constants dropped\n", lists[k]); continue; }
+        NSArray *vals = ((id(*)(id, SEL))objc_msgSend)(o, s);
+        for (id v in vals) {
+            NSUInteger t = ((NSUInteger(*)(id, SEL))objc_msgSend)(v, sel_registerName("dataType"));
+            const void *p = ((const void *(*)(id, SEL))objc_msgSend)(v, sel_registerName("data"));
+            NSUInteger sz = constantSize(t);
+            id key = k == 0 ? (id)@(((NSUInteger(*)(id, SEL))objc_msgSend)(v, sel_registerName("index")))
+                            : ((id(*)(id, SEL))objc_msgSend)(v, sel_registerName("name"));
+            if (!sz || !p || !key) { fprintf(stderr, "[mclmetal] function constant %s of type %lu dropped\n", [[key description] UTF8String], (unsigned long)t); continue; }
+            [a addObject:@[key, @(t), [NSData dataWithBytes:p length:sz]]];
+        }
+        [vals release];
+    }
+    if (gTrace) fprintf(stderr, "[mclmetal] function constants: %lu\n", (unsigned long)a.count);
+    return @{@"fcv": a};
 }
 
 static NSDictionary *describe(id o) {
@@ -339,9 +383,16 @@ static NSDictionary *describe(id o) {
 
 static void dispatch_release_compat(dispatch_data_t d) { [(id)d release]; }
 
+static BOOL isSurface(id o) {
+    static Class c;
+    if (!c) c = objc_getClass("IOSurface");
+    return c && [o isKindOfClass:c];
+}
+
 static id encodeObject(id o) {
     if (!o) return NILV();
     if (object_getClass(o) == [MCLProxy class]) return @{@"h": @(((MCLProxy *)o)->_h)};
+    if (isSurface(o)) return @{@"iosurf": @(IOSurfaceGetID((IOSurfaceRef)o))};   // the host looks it up by global id
     if ([o isKindOfClass:NSClassFromString(@"OS_dispatch_data")]) {
         const void *p = NULL;
         size_t n = 0;
@@ -362,6 +413,7 @@ static id encodeObject(id o) {
         return m;
     }
     if ([o isKindOfClass:[NSURL class]]) return @{@"url": [(NSURL *)o absoluteString]};
+    if (isConstantValues(o)) return encodeConstants(o);
     if (isDescriptorClass(o)) return gOldDesc ? describe(o) : @{@"dbin": descBinary(o)};
     return @{@"u": @(object_getClassName(o))};
 }
@@ -475,7 +527,15 @@ static id decode(id v, BOOL nw) {
     if (d[@"z"]) return nil;
     if (d[@"e"]) {
         NSDictionary *e = d[@"e"];
-        return [NSError errorWithDomain:e[@"d"] code:[e[@"k"] integerValue] userInfo:@{NSLocalizedDescriptionKey: e[@"m"] ?: @"", NSLocalizedFailureReasonErrorKey: e[@"f"] ?: @""}];
+        return [NSError errorWithDomain:e[@"d"] ?: @"MCLRemoteError" code:[e[@"k"] integerValue] userInfo:@{NSLocalizedDescriptionKey: e[@"m"] ?: @"", NSLocalizedFailureReasonErrorKey: e[@"f"] ?: @""}];
+    }
+    if (d[@"iosurf"]) {
+        // A host IOSurface: take our own reference by global id, then give back the host's table reference.
+        id s = (id)IOSurfaceLookup([d[@"iosurf"] unsignedIntValue]);
+        if (!s) fprintf(stderr, "[mclmetal] IOSurface id %u not found\n", [d[@"iosurf"] unsignedIntValue]);
+        if (gTrace) fprintf(stderr, "[mclmetal] iosurf id=%u -> %p ih=%llu %s\n", [d[@"iosurf"] unsignedIntValue], s, [d[@"ih"] unsignedLongLongValue], nw ? "+1" : "autoreleased");
+        if (d[@"ih"]) tq_drop([d[@"ih"] unsignedLongLongValue]);
+        return nw ? s : [s autorelease];
     }
     if (d[@"h"]) {
         mcl_init();
@@ -1379,10 +1439,21 @@ static NSArray *mcl_MTLCopyAllDevices(void) {
 id mcl_default_device(void) { return mcl_MTLCreateSystemDefaultDevice(); }
 #endif
 
+// Presentation trace (MCL_TRACE): the GL renderer presents through CGLFlushDrawable, outside the Metal proxies.
+extern int CGLFlushDrawable(void *ctx) __attribute__((weak_import));
+static int mcl_CGLFlushDrawable(void *ctx) {
+    static _Atomic uint64_t n;
+    uint64_t k = ++n;
+    mcl_init();
+    if (gTrace && (k <= 20 || k % 100 == 0)) fprintf(stderr, "[mclmetal] CGLFlushDrawable #%llu ctx=%p\n", k, ctx);
+    return CGLFlushDrawable(ctx);
+}
+
 struct mcl_interpose { const void *replacement; const void *replacee; };
 __attribute__((used)) static const struct mcl_interpose mcl_interposers[] __attribute__((section("__DATA,__interpose"))) = {
     {(const void *)mcl_MTLCreateSystemDefaultDevice, (const void *)MTLCreateSystemDefaultDevice},
     {(const void *)mcl_MTLCopyAllDevices, (const void *)MTLCopyAllDevices},
+    {(const void *)mcl_CGLFlushDrawable, (const void *)CGLFlushDrawable},
 };
 
 static void stats_atexit(void) { tq_flush_current(); stats_dump_force(); }

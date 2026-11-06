@@ -9,9 +9,9 @@ cd "$(dirname "$0")"
 OUT=${OUT:-out}
 mkdir -p $OUT
 clang -arch x86_64 -dynamiclib -fobjc-arc -O2 -framework Foundation -framework Metal -framework IOSurface \
-  -install_name @rpath/libmclbridge.dylib mclbridge.m -o $OUT/libmclbridge.dylib
+  -framework CoreGraphics -framework ImageIO -install_name @rpath/libmclbridge.dylib mclbridge.m -o $OUT/libmclbridge.dylib
 clang -arch arm64 -dynamiclib -fno-objc-arc -O2 -framework Foundation -framework Metal -framework IOSurface \
-  -install_name @rpath/libmclmetal.dylib mclmetal.m -o $OUT/libmclmetal.dylib
+  -weak_framework OpenGL -install_name @rpath/libmclmetal.dylib mclmetal.m -o $OUT/libmclmetal.dylib
 codesign -f -s - $OUT/libmclbridge.dylib $OUT/libmclmetal.dylib
 if [ "$(uname -m)" = arm64 ]; then
   clang -arch arm64 -c -fobjc-arc -O2 -DMCL_LOOPBACK mclbridge.m -o $OUT/bridge_loop.o

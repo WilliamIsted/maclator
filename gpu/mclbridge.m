@@ -9,6 +9,8 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
+#import <ImageIO/ImageIO.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -45,6 +47,8 @@ static NSSet *gMemoLegacy;
 static id memoGet(NSData *key, NSNumber **hashOut);
 static void memoPut(NSNumber *hk, NSData *key, id obj);
 static NSMutableSet *gClassSent;   // class ids whose description the guest has received
+static const char *gDumpDir;
+static NSMutableSet *gDumpSurfs;
 
 static void ensureInit(void) {
     static dispatch_once_t once;
@@ -58,6 +62,8 @@ static void ensureInit(void) {
         gMemoLegacy = [NSSet setWithObjects:@"newRenderPipelineStateWithDescriptor:error:", @"newComputePipelineStateWithFunction:error:", @"newLibraryWithSource:options:error:", @"newLibraryWithData:error:", nil];
         gTrace = getenv("MCL_TRACE") != NULL;
         gStats = getenv("MCL_STATS") != NULL;
+        gDumpDir = getenv("MCL_DUMP_DIR");
+        gDumpSurfs = [NSMutableSet new];
     });
 }
 
@@ -173,6 +179,94 @@ static NSDictionary *classInfo(id o) {
     return d;
 }
 
+// ---- diagnostics: MCL_DUMP_DIR=<dir> ------------------------------------------------
+// Off unless MCL_DUMP_DIR is set. Every IOSurface seen as a texture backing, drawable surface or render
+// target is written to <dir>/surf-<id>-<n>.png after the 2nd, 10th and 50th completed command buffer;
+// failed command buffers and the first 3 render passes are logged.
+static _Atomic unsigned gDumpDone, gDumpPasses;
+
+static void noteSurface(uint32_t sid) {
+    if (!gDumpDir || !sid) return;
+    @synchronized(gDumpSurfs) { [gDumpSurfs addObject:@(sid)]; }
+}
+
+static void dumpSurface(uint32_t sid, unsigned n) {
+    IOSurfaceRef s = IOSurfaceLookup(sid);
+    if (!s) { fprintf(stderr, "[mcldump] surface %u gone\n", sid); return; }
+    OSType pf = IOSurfaceGetPixelFormat(s);
+    size_t w = IOSurfaceGetWidth(s), ht = IOSurfaceGetHeight(s), bpr = IOSurfaceGetBytesPerRow(s);
+    CGBitmapInfo bi = pf == 'BGRA' ? (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+                    : pf == 'RGBA' ? (CGBitmapInfo)kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big : 0;
+    if (!bi || !w || !ht) {
+        fprintf(stderr, "[mcldump] surface %u %zux%zu pixel format '%c%c%c%c' (0x%x) not dumped\n", sid, w, ht,
+                (char)(pf >> 24), (char)(pf >> 16), (char)(pf >> 8), (char)pf, (unsigned)pf);
+        CFRelease(s);
+        return;
+    }
+    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+    const uint8_t *base = IOSurfaceGetBaseAddress(s);
+    CFDataRef data = CFDataCreate(NULL, base, bpr * ht);
+    uint32_t px0, pxc;
+    memcpy(&px0, base, 4);
+    memcpy(&pxc, base + (ht / 2) * bpr + (w / 2) * 4, 4);
+    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+    CGDataProviderRef dp = CGDataProviderCreateWithCFData(data);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGImageRef img = CGImageCreate(w, ht, 8, 32, bpr, cs, bi, dp, NULL, false, kCGRenderingIntentDefault);
+    NSString *path = [NSString stringWithFormat:@"%s/surf-%u-%u.png", gDumpDir, sid, n];
+    CGImageDestinationRef dst = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], CFSTR("public.png"), 1, NULL);
+    bool ok = false;
+    if (dst && img) { CGImageDestinationAddImage(dst, img, NULL); ok = CGImageDestinationFinalize(dst); }
+    fprintf(stderr, "[mcldump] surface %u %zux%zu '%c%c%c%c' pixel[0]=%08x centre=%08x -> %s %s\n", sid, w, ht,
+            (char)(pf >> 24), (char)(pf >> 16), (char)(pf >> 8), (char)pf, px0, pxc, path.UTF8String, ok ? "ok" : "FAILED");
+    if (dst) CFRelease(dst);
+    CGImageRelease(img);
+    CGColorSpaceRelease(cs);
+    CGDataProviderRelease(dp);
+    CFRelease(data);
+    CFRelease(s);
+}
+
+static void dumpCompleted(id<MTLCommandBuffer> cb) {
+    unsigned n = ++gDumpDone;
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        NSError *e = cb.error;
+        fprintf(stderr, "[mcldump] command buffer #%u status %ld error %s %ld %s\n", n, (long)cb.status,
+                e.domain.UTF8String ?: "-", (long)e.code, e.localizedDescription.UTF8String ?: "-");
+    }
+    if (n != 2 && n != 10 && n != 50) return;
+    NSArray *ids;
+    @synchronized(gDumpSurfs) { ids = gDumpSurfs.allObjects; }
+    for (NSNumber *sid in ids) dumpSurface(sid.unsignedIntValue, n);
+}
+
+// Called before every forwarded call while MCL_DUMP_DIR is set.
+static void dumpBefore(id target, const char *sel, NSInvocation *inv) {
+    if (strncmp(sel, "commit", 6) == 0 && [target conformsToProtocol:@protocol(MTLCommandBuffer)]) {
+        id<MTLCommandBuffer> cb = target;
+        if (cb.status <= MTLCommandBufferStatusEnqueued) [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { dumpCompleted(c); }];
+    } else if (strncmp(sel, "setDrawableSurface:", 19) == 0) {
+        uint32_t sid = 0;
+        [inv getArgument:&sid atIndex:2];
+        noteSurface(sid);
+    } else if (strcmp(sel, "renderCommandEncoderWithDescriptor:") == 0 && gDumpPasses < 3) {
+        unsigned k = ++gDumpPasses;
+        __unsafe_unretained MTLRenderPassDescriptor *rp = nil;
+        [inv getArgument:&rp atIndex:2];
+        MTLRenderPassColorAttachmentDescriptor *ca = rp.colorAttachments[0];
+        id<MTLTexture> t = ca.texture;
+        IOSurfaceRef s = t.iosurface;
+        MTLClearColor c = ca.clearColor;
+        [gLock lock];
+        uint64_t th = t ? (uint64_t)NSMapGet(gRev, (__bridge void *)t) : 0;
+        [gLock unlock];
+        fprintf(stderr, "[mcldump] render pass %u: color0 texture h=%llu %s %lux%lu fmt=%lu iosurface=%u load=%lu store=%lu clear=(%g,%g,%g,%g)\n",
+                k, th, t ? object_getClassName(t) : "nil", (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat,
+                s ? IOSurfaceGetID(s) : 0, (unsigned long)ca.loadAction, (unsigned long)ca.storeAction, c.red, c.green, c.blue, c.alpha);
+        if (s) noteSurface(IOSurfaceGetID(s));
+    }
+}
+
 // ---- encode / decode ----------------------------------------------------------------
 static id encObj(id o, BOOL adopt);
 
@@ -182,8 +276,21 @@ static NSDictionary *encHandle(id o, BOOL adopt) {
     return @{@"h": @(h), @"c": ci[@"c"], @"p": ci[@"p"], @"i": ci[@"i"]};
 }
 
+// IOSurfaces cross as their global id: the guest gets its own IOSurfaceRef from IOSurfaceLookup. The table
+// keeps the host surface ("ih") until the guest has looked it up and dropped that handle.
+static BOOL isSurface(id o) {
+    static Class c;
+    if (!c) c = objc_getClass("IOSurface");
+    return c && [o isKindOfClass:c];
+}
+
 static id encObj(id o, BOOL adopt) {
     if (!o) return NILV();
+    if (isSurface(o)) {
+        uint32_t sid = IOSurfaceGetID((__bridge IOSurfaceRef)o);
+        noteSurface(sid);
+        return @{@"iosurf": @(sid), @"ih": @(handleFor(o, adopt))};
+    }
     if ([o isKindOfClass:[NSString class]] || [o isKindOfClass:[NSNumber class]] || [o isKindOfClass:[NSData class]]) return o;
     if ([o isKindOfClass:[NSArray class]]) {
         NSMutableArray *a = [NSMutableArray new];
@@ -216,7 +323,17 @@ static id decObj(id v) {
         NSDictionary *d = v;
         if (d[@"z"]) return nil;
         if (d[@"h"]) return objFor(d[@"h"]);
+        if (d[@"iosurf"]) { noteSurface([d[@"iosurf"] unsignedIntValue]); return (__bridge_transfer id)IOSurfaceLookup([d[@"iosurf"] unsignedIntValue]); }
         if (d[@"$d"]) return buildDesc(d);
+        if (d[@"fcv"]) {   // function constants: [index or name, MTLDataType, bytes]
+            MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+            for (NSArray *e in d[@"fcv"]) {
+                NSData *b = e[2];
+                if ([e[0] isKindOfClass:[NSString class]]) [cv setConstantValue:b.bytes type:[e[1] unsignedIntegerValue] withName:e[0]];
+                else [cv setConstantValue:b.bytes type:[e[1] unsignedIntegerValue] atIndex:[e[0] unsignedIntegerValue]];
+            }
+            return cv;
+        }
         if (d[@"dbin"]) { NSData *bd = d[@"dbin"]; const uint8_t *dp = bd.bytes; return bd.length ? parseDesc(&dp, nil) : nil; }
         if (d[@"dd"]) {
             NSData *nd = d[@"dd"];
@@ -239,6 +356,116 @@ static id decObj(id v) {
 static const char *skipQual(const char *t) {
     while (*t == 'r' || *t == 'n' || *t == 'N' || *t == 'o' || *t == 'O' || *t == 'R' || *t == 'V') t++;
     return t;
+}
+
+// ---- method type encodings ----------------------------------------------------------
+// NSMethodSignature cannot take everything the runtime emits: a struct with bitfields comes back as "{?}"
+// with size 0 (and NSGetSizeAndAlignment then throws), unions, arrays and _Atomic are refused outright.
+// normEnc rewrites such a type as a named struct of integers with the same C size and alignment, and
+// leaves every other type as it was (minus the frame offsets).
+// ponytail: unions/bitfields become integer fields, which is right for the integer register ABI only; a
+// union of floats would need FP fields (none seen in Metal).
+static void tinfo(const char **pp, NSUInteger *sz, NSUInteger *al, BOOL *clean) {
+    const char *p = *pp;
+    while (*p && strchr("rnNoORVAj", *p)) { if (*p == 'A' || *p == 'j') *clean = NO; p++; }
+    char c = *p++;
+    *sz = 8; *al = 8;
+    switch (c) {
+    case 'c': case 'C': case 'B': *sz = *al = 1; break;
+    case 's': case 'S': *sz = *al = 2; break;
+    case 'i': case 'I': case 'f': case 'l': case 'L': *sz = *al = 4; break;
+    case 'q': case 'Q': case 'd': case '#': case ':': case '*': break;
+    case 'D': *sz = *al = 16; break;
+    case 'v': *sz = 0; *al = 1; break;
+    case '?': *clean = NO; break;
+    case '@':
+        if (*p == '?') p++;
+        if (*p == '"') { p = strchr(p + 1, '"'); p = p ? p + 1 : *pp + strlen(*pp); }
+        break;
+    case '^': {
+        NSUInteger s, a; BOOL inner = YES;
+        tinfo(&p, &s, &a, &inner);
+        if (!inner) *clean = NO;
+        break;
+    }
+    case '[': {
+        NSUInteger n = strtoul(p, (char **)&p, 10), s, a;
+        tinfo(&p, &s, &a, clean);
+        if (*p == ']') p++;
+        *sz = n * s; *al = a;
+        break;
+    }
+    case 'b': {   // only reached outside a struct
+        NSUInteger bits = strtoul(p, (char **)&p, 10);
+        *sz = *al = bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 4 : 8;
+        *clean = NO;
+        break;
+    }
+    case '{': case '(': {
+        char close = c == '{' ? '}' : ')';
+        if (c == '(') *clean = NO;
+        while (*p && *p != '=' && *p != close) p++;
+        NSUInteger off = 0, maxal = 1, bits = 0;
+        if (*p == '=') {
+            p++;
+            while (*p && *p != close) {
+                if (*p == 'b') {   // bitfield run: packed, flushed into the smallest integer unit that holds it
+                    p++;
+                    bits += strtoul(p, (char **)&p, 10);
+                    *clean = NO;
+                    continue;
+                }
+                if (bits) { NSUInteger u = bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 4 : 8; off = (off + u - 1) / u * u + (bits + 7) / 8; if (u > maxal) maxal = u; bits = 0; }
+                if (*p == '"') { p = strchr(p + 1, '"'); if (!p) break; p++; }
+                NSUInteger s, a;
+                tinfo(&p, &s, &a, clean);
+                if (a > maxal) maxal = a;
+                if (c == '{') off = (off + a - 1) / a * a + s;
+                else if (s > off) off = s;
+            }
+            if (bits) { NSUInteger u = bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 4 : 8; off = (off + u - 1) / u * u + (bits + 7) / 8; if (u > maxal) maxal = u; }
+        }
+        if (*p == close) p++;
+        *al = maxal;
+        *sz = (off + maxal - 1) / maxal * maxal;
+        break;
+    }
+    default: *clean = NO; break;
+    }
+    *pp = p;
+}
+
+static NSString *normEnc(const char *enc) {
+    NSMutableString *out = [NSMutableString new];
+    const char *p = enc;
+    for (int i = 0; *p; i++) {
+        const char *start = p;
+        NSUInteger sz, al;
+        BOOL clean = YES;
+        tinfo(&p, &sz, &al, &clean);
+        const char *b = skipQual(start);
+        if (*b == '[' && i != 0) clean = NO;   // an array parameter is passed as a pointer
+        if (clean) [out appendFormat:@"%.*s", (int)(p - start), start];
+        else if (*b == '^' || *b == '[') [out appendString:@"^v"];
+        else {
+            char f = al >= 8 ? 'Q' : al == 4 ? 'I' : al == 2 ? 'S' : 'C';
+            NSUInteger u = al >= 8 ? 8 : al;
+            [out appendFormat:@"{mcl_%lu_%lu=", (unsigned long)sz, (unsigned long)u];
+            for (NSUInteger k = 0; k < (sz + u - 1) / u; k++) [out appendFormat:@"%c", f];
+            [out appendString:@"}"];
+        }
+        while (*p >= '0' && *p <= '9') p++;
+        if (p == start) break;
+    }
+    return out;
+}
+
+// The host's signature for a selector, built from the normalised encoding (see normEnc).
+static NSMethodSignature *hostSig(id target, SEL sel) {
+    Method m = class_getInstanceMethod(object_getClass(target), sel);
+    if (!m) return [target methodSignatureForSelector:sel];
+    @try { return [NSMethodSignature signatureWithObjCTypes:normEnc(method_getTypeEncoding(m)).UTF8String]; }
+    @catch (NSException *e) { TRACE("no signature for %s: %s", sel_getName(sel), e.reason.UTF8String); return nil; }
 }
 
 static void setBytesArg(NSInvocation *inv, NSUInteger idx, const char *type, NSData *d) {
@@ -330,6 +557,8 @@ static id makeBlock(NSDictionary *bd) {
 // ---- message dispatch ---------------------------------------------------------------
 static BOOL isNewFamily(NSString *sel) {
     const char *s = sel.UTF8String;
+    // Not new-family by name, but returns +1 (IOAccelGLDrawableLookupIOSurfaceFromIndex -> IOSurfaceLookupFromMachPort).
+    if (strcmp(s, "lookupIOSurfaceAtIndex:") == 0) return YES;
     while (*s == '_') s++;
     static const char *fam[] = {"new", "alloc", "copy", "mutableCopy"};
     for (int i = 0; i < 4; i++) {
@@ -344,7 +573,7 @@ static NSDictionary *doMsg(NSDictionary *req) {
     NSString *selName = req[@"sel"];
     if (!target) return @{@"x": [NSString stringWithFormat:@"invalid handle %@ for %@", req[@"h"], selName]};
     SEL sel = NSSelectorFromString(selName);
-    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+    NSMethodSignature *sig = hostSig(target, sel);
     if (!sig) return @{@"x": [NSString stringWithFormat:@"-[%s %@]: unrecognized selector", object_getClassName(target), selName]};
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
     inv.target = target;
@@ -352,9 +581,8 @@ static NSDictionary *doMsg(NSDictionary *req) {
     [inv retainArguments];
     NSArray *args = req[@"args"];
     NSMutableArray *keep = [NSMutableArray new];
-    NSError *__autoreleasing *errSlot = NULL;
-    NSError *__autoreleasing errStore = nil;
-    BOOL wantErr = NO;
+    // Object out-parameters (error:, reflection:, ...), one slot each, in argument order; the callee stores +0 objects.
+    void *outs[8] = {0}; int nOut = 0;
     void **idArrays[8]; int nIdArr = 0;
     CFTypeRef surfs[4]; int nSurf = 0;
     for (NSUInteger i = 2; i < sig.numberOfArguments; i++) {
@@ -369,6 +597,7 @@ static NSDictionary *doMsg(NSDictionary *req) {
             CFTypeRef surf = (sid && lookup) ? lookup(sid) : NULL;
             if (!surf) TRACE("IOSurface id %u not found", sid);
             if (surf && nSurf < 4) surfs[nSurf++] = surf;
+            if (surf) noteSurface(sid);
             [inv setArgument:&surf atIndex:i];
         } else if (b[0] == '@' && b[1] == '?') {
             id blk = ([v isKindOfClass:[NSDictionary class]] && v[@"blk"]) ? makeBlock(v) : nil;
@@ -390,9 +619,8 @@ static NSDictionary *doMsg(NSDictionary *req) {
                 idArrays[nIdArr++] = arr;
                 [inv setArgument:&arr atIndex:i];
             } else {
-                wantErr = [v isKindOfClass:[NSDictionary class]] && v[@"outerr"];
-                errSlot = wantErr ? &errStore : NULL;
-                [inv setArgument:&errSlot atIndex:i];
+                void **slot = ([v isKindOfClass:[NSDictionary class]] && v[@"outerr"] && nOut < 8) ? &outs[nOut++] : NULL;
+                [inv setArgument:&slot atIndex:i];
             }
         } else {
             setBytesArg(inv, i, t, v);
@@ -411,6 +639,7 @@ static NSDictionary *doMsg(NSDictionary *req) {
             }
         }
     }
+    if (gDumpDir) dumpBefore(target, selName.UTF8String, inv);
     @try {
         [inv invoke];
     } @catch (NSException *e) {
@@ -421,15 +650,25 @@ static NSDictionary *doMsg(NSDictionary *req) {
     for (int k = 0; k < nIdArr; k++) free(idArrays[k]);
     for (int k = 0; k < nSurf; k++) CFRelease(surfs[k]);
     NSMutableDictionary *reply = [NSMutableDictionary new];
+    BOOL failed = NO;
+    if (nOut) {
+        NSMutableArray *oa = [NSMutableArray new];
+        for (int k = 0; k < nOut; k++) {
+            id o = (__bridge id)outs[k];
+            if ([o isKindOfClass:[NSError class]]) failed = YES;
+            [oa addObject:encObj(o, NO)];
+        }
+        reply[@"outs"] = oa;
+    }
     const char *rt = skipQual([sig methodReturnType]);
     if (rt[0] == 'v') {
-    } else if (rt[0] == '@') {
+    } else if (rt[0] == '@' || strncmp(rt, "^{__IOSurface", 13) == 0) {
         __unsafe_unretained id r = nil;
         [inv getReturnValue:&r];
         // NSInvocation does not retain the result; new-family results are +1, others +0.
         // The handle table takes its own reference, so drop ours for the +1 case.
         BOOL nw = r && isNewFamily(selName);
-        if (r && memoKey && !(wantErr && errStore)) memoPut(memoKey, memoData, r);
+        if (r && memoKey && !failed) memoPut(memoKey, memoData, r);
         reply[@"r"] = encObj(r, NO);
         if (nw) CFRelease((__bridge CFTypeRef)r);
     } else {
@@ -439,7 +678,6 @@ static NSDictionary *doMsg(NSDictionary *req) {
         [inv getReturnValue:d.mutableBytes];
         reply[@"r"] = d;
     }
-    if (wantErr && errStore) reply[@"err"] = encObj(errStore, NO);
     return reply;
 }
 
@@ -453,7 +691,7 @@ static NSDictionary *handleReq(NSDictionary *req) {
         SEL sel = NSSelectorFromString(req[@"sel"]);
         Method m = target ? class_getInstanceMethod(object_getClass(target), sel) : NULL;
         if (!m) return @{};
-        return @{@"t": @(method_getTypeEncoding(m))};
+        return @{@"t": normEnc(method_getTypeEncoding(m))};
     }
     if ([cmd isEqualToString:@"root"]) {
         NSString *what = req[@"what"];
@@ -675,7 +913,7 @@ static NSMethodSignature *sigFor(id target, uint32_t selid) {
     NSMethodSignature *sg = gSigCache[k];
     [gLock unlock];
     if (!sg) {
-        sg = [target methodSignatureForSelector:gSelTab[selid]];
+        sg = hostSig(target, gSelTab[selid]);
         if (sg) { [gLock lock]; gSigCache[k] = sg; [gLock unlock]; }
     }
     return sg;
@@ -788,6 +1026,7 @@ static void *execCall(const uint8_t *rec, uint32_t reclen, uint8_t kind, uint32_
     }
     uint64_t t0 = gStats ? mach_absolute_time() : 0;
     NSString *excMsg = nil;
+    if (gDumpDir) dumpBefore(target, gSelNames[selid], inv);
     @try {
         [inv invoke];
     } @catch (NSException *e) {
@@ -813,7 +1052,7 @@ static void *execCall(const uint8_t *rec, uint32_t reclen, uint8_t kind, uint32_
     if (!sync) return NULL;
     if (excMsg) return putReply(MCL_T_EXC, 0, 0, excMsg.UTF8String, (uint32_t)excMsg.length, outlen);
     if (rt[0] == 'v') return putReply(MCL_T_VOID, 0, gEvPushed, NULL, 0, outlen);
-    if (rt[0] != '@') {
+    if (rt[0] != '@' && strncmp(rt, "^{__IOSurface", 13) != 0) {
         uint64_t v = 0;
         NSUInteger sz = 0;
         NSGetSizeAndAlignment(rt, &sz, NULL);
