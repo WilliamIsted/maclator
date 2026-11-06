@@ -59,12 +59,45 @@ pub fn inject(envp: &mut Vec<String>) -> bool {
     } else {
         envp.push(format!("DYLD_INSERT_LIBRARIES={shim}"));
     }
+    if let Some(d) = std::env::var_os("MACLATOR_GPU_DIR") {
+        if !envp.iter().any(|e| e.starts_with("MACLATOR_GPU_DIR=")) {
+            envp.push(format!("MACLATOR_GPU_DIR={}", d.to_string_lossy()));
+        }
+    }
     if let Some(dir) = find(BRIDGE_NAME) {
         if !envp.iter().any(|e| e.starts_with("MACLATOR_GPU_BRIDGE=")) {
             envp.push(format!("MACLATOR_GPU_BRIDGE={}", dir.to_string_lossy()));
         }
     }
     true
+}
+
+/// Frameworks whose direct linking turns the bridge on under `gpu=auto`.
+const GPU_FRAMEWORKS: &[&str] =
+    &["Metal", "MetalKit", "OpenGL", "GLKit", "SceneKit", "SpriteKit", "RealityKit", "MetalPerformanceShaders", "MetalFX"];
+
+/// `gpu=auto`: should the guest `exe` (resolved path) get the bridge, and why. `gpu_off` prefixes win
+/// over `gpu_on`, both over detection. Detection reads only the main executable's own load commands
+/// (arm64e slice preferred), no recursion; nothing of Metal or the bridge is touched.
+pub fn auto_decision(exe: &str, on: &[String], off: &[String]) -> (bool, String) {
+    if let Some(p) = off.iter().find(|p| exe.starts_with(p.as_str())) {
+        return (false, format!("gpu_off={p}"));
+    }
+    if let Some(p) = on.iter().find(|p| exe.starts_with(p.as_str())) {
+        return (true, format!("gpu_on={p}"));
+    }
+    let m = match crate::macho::MachO::open_arm64(exe, true) {
+        Ok(m) => m,
+        Err(e) => return (false, format!("load commands not read: {e}")),
+    };
+    let linked = m.dylibs().into_iter().find_map(|d| {
+        let name = d.strip_prefix("/System/Library/Frameworks/")?.split_once(".framework/")?.0.to_string();
+        GPU_FRAMEWORKS.contains(&name.as_str()).then_some(name)
+    });
+    match linked {
+        Some(n) => (true, format!("links {n}")),
+        None => (false, "no GPU framework linked".into()),
+    }
 }
 
 static BRIDGE: OnceLock<Option<(CallFn, Option<extern "C" fn()>)>> = OnceLock::new();
@@ -257,5 +290,64 @@ pub fn hostcall(cpu: &mut Cpu) {
             cpu.x[0] = libc::EIO as u64;
             cpu.cf = 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_decision;
+    use std::process::Command;
+
+    /// Build a tiny `arch` executable linking each `(flag, framework)` (-framework / -weak_framework).
+    fn build(dir: &std::path::Path, name: &str, arch: &str, links: &[(&str, &str)]) -> String {
+        let src = dir.join("m.c");
+        std::fs::write(&src, "int main(void){return 0;}\n").unwrap();
+        let out = dir.join(name);
+        let mut c = Command::new("clang");
+        c.args(["-arch", arch, "-o"]).arg(&out).arg(&src);
+        for (flag, fw) in links {
+            c.args([flag, fw]);
+        }
+        assert!(c.status().unwrap().success(), "clang {name}");
+        out.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn detection_and_overrides() {
+        let dir = std::env::temp_dir().join(format!("mcl-gpu-auto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gl = build(&dir, "gl", "arm64e", &[("-framework", "OpenGL")]);
+        let mtl = build(&dir, "mtl", "arm64e", &[("-framework", "Metal")]);
+        let weak = build(&dir, "weak", "arm64e", &[("-weak_framework", "MetalKit")]);
+        let none = build(&dir, "none", "arm64e", &[("-framework", "CoreFoundation")]);
+        let x86 = build(&dir, "x86", "x86_64", &[]);
+        let fat = dir.join("fat").to_string_lossy().into_owned();
+        assert!(Command::new("lipo").args(["-create", &x86, &mtl, "-output", &fat]).status().unwrap().success());
+        let x86m = build(&dir, "x86m", "x86_64", &[("-framework", "Metal")]);
+        let fat2 = dir.join("fat2").to_string_lossy().into_owned();
+        assert!(Command::new("lipo").args(["-create", &x86m, &none, "-output", &fat2]).status().unwrap().success());
+
+        let d = |p: &str| auto_decision(p, &[], &[]);
+        assert_eq!(d(&gl), (true, "links OpenGL".into()));
+        assert_eq!(d(&mtl), (true, "links Metal".into()));
+        assert_eq!(d(&weak), (true, "links MetalKit".into()));
+        assert_eq!(d(&none), (false, "no GPU framework linked".into()));
+        assert_eq!(d(&fat), (true, "links Metal".into()));
+        // Fat file whose x86_64 slice links Metal and arm64e slice does not: only arm64e counts.
+        assert_eq!(d(&fat2), (false, "no GPU framework linked".into()));
+        assert!(!d(&dir.join("missing").to_string_lossy()).0);
+
+        let dirs = dir.to_string_lossy().into_owned();
+        let v = |s: &str| vec![s.to_string()];
+        assert_eq!(auto_decision(&none, &v(&dirs), &[]), (true, format!("gpu_on={dirs}")));
+        assert_eq!(auto_decision(&mtl, &[], &v(&mtl)), (false, format!("gpu_off={mtl}")));
+        assert_eq!(auto_decision(&mtl, &v(&dirs), &v(&dirs)), (false, format!("gpu_off={dirs}")));
+        assert_eq!(auto_decision(&gl, &v("/nowhere"), &v("/nowhere")), (true, "links OpenGL".into()));
+
+        // GG's Chess: fat, one arm64e slice (subtype 12); links MetalPerformanceShaders first, then
+        // MetalKit, OpenGL and Metal.
+        let chess = std::env::var("MCL_TEST_CHESS").expect("set MCL_TEST_CHESS to GG's Chess executable");
+        assert_eq!(d(&chess), (true, "links MetalPerformanceShaders".into()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

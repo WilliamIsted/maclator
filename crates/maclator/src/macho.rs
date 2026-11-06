@@ -17,6 +17,10 @@ pub const LC_LOAD_DYLINKER: u32 = 0xe;
 pub const LC_FUNCTION_STARTS: u32 = 0x26;
 pub const LC_SYMTAB: u32 = 0x2;
 pub const LC_UUID: u32 = 0x1b;
+pub const LC_LOAD_DYLIB: u32 = 0xc;
+pub const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018;
+pub const LC_REEXPORT_DYLIB: u32 = 0x8000_001f;
+pub const LC_LOAD_UPWARD_DYLIB: u32 = 0x8000_0023;
 
 pub const MH_EXECUTE: u32 = 2;
 pub const MH_DYLINKER: u32 = 7;
@@ -175,6 +179,26 @@ impl MachO {
             p += cmdsize;
         }
         Ok(m)
+    }
+
+    /// Install names of the libraries this image links directly (load, weak, re-export, upward).
+    pub fn dylibs(&self) -> Vec<String> {
+        let b = &self.header_bytes;
+        let (mut out, mut p) = (Vec::new(), 32usize);
+        for _ in 0..b.get(16..20).map_or(0, |_| rd32(b, 16)) {
+            let Some(h) = b.get(p..p + 12) else { break };
+            let (cmd, size, off) = (rd32(h, 0), rd32(h, 4) as usize, rd32(h, 8) as usize);
+            if matches!(cmd, LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB | LC_LOAD_UPWARD_DYLIB) {
+                if let Some(name) = b.get(p + off..p + size) {
+                    out.push(cstr(name));
+                }
+            }
+            if size < 8 {
+                break;
+            }
+            p += size;
+        }
+        out
     }
 
     pub fn text_vmaddr(&self) -> u64 {

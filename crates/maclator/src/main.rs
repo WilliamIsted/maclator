@@ -32,6 +32,7 @@ fn usage() -> ! {
     eprintln!("  --sysroot DIR   directory with the arm64 dyld shared cache files");
     eprintln!("  --trace         trace system calls");
     eprintln!("  --gpu           route the guest's Metal API to the host GPU");
+    eprintln!("  --gpu-auto      --gpu only for guests that link a GPU framework directly");
     std::process::exit(2);
 }
 
@@ -80,6 +81,11 @@ fn main() {
             "--gpu" => {
                 // Route the guest's Metal API to the host GPU (see gpu.rs).
                 std::env::set_var("MACLATOR_GPU", "1");
+                args.remove(0);
+            }
+            "--gpu-auto" => {
+                // MACLATOR_GPU=auto: decide per guest from its load commands (gpu::auto_decision).
+                std::env::set_var("MACLATOR_GPU", "auto");
                 args.remove(0);
             }
             "--gpu-only" => {
@@ -179,8 +185,8 @@ fn main() {
         if !jit::JIT_ENABLED.load(Ordering::Relaxed) {
             fwd.push("--interp".into());
         }
-        if std::env::var_os("MACLATOR_GPU").is_some() {
-            fwd.push("--gpu".into());
+        if let Some(g) = std::env::var_os("MACLATOR_GPU") {
+            fwd.push(if g == "auto" { "--gpu-auto" } else { "--gpu" }.into());
             if let Ok(o) = std::env::var("MACLATOR_GPU_ONLY") {
                 fwd.push("--gpu-only".into());
                 fwd.push(o);
@@ -201,8 +207,18 @@ fn main() {
     }
     let exe = resolve_path(&args[0]);
     workq::set_kqueue_pool_target(&exe);
-    let gpu_active = std::env::var_os("MACLATOR_GPU").is_some()
-        && std::env::var("MACLATOR_GPU_ONLY").map(|o| args.iter().skip(1).any(|a| a.contains(&o))).unwrap_or(true);
+    let gpu_env = std::env::var_os("MACLATOR_GPU");
+    let mut gpu_why = None;
+    let gpu_active = gpu_env.is_some()
+        && std::env::var("MACLATOR_GPU_ONLY").map(|o| args.iter().skip(1).any(|a| a.contains(&o))).unwrap_or(true)
+        && (gpu_env.as_ref().is_some_and(|g| g != "auto") || {
+            let (on, why) = {
+                let r = GPU_RULES.lock().unwrap();
+                gpu::auto_decision(&exe, &r.0, &r.1)
+            };
+            gpu_why = Some(why);
+            on
+        });
     let mut envp: Vec<String> = std::env::vars()
         .filter(|(k, _)| !k.starts_with("MACLATOR_") || matches!(k.as_str(), "MACLATOR_DUMP_ON_FAULT" | "MACLATOR_GPU_BRIDGE" | "MACLATOR_JIT_THRESHOLD" | "MACLATOR_STATS" | "MACLATOR_FALLBACK_HIST"))
         .map(|(k, v)| format!("{k}={v}"))
@@ -222,6 +238,9 @@ fn main() {
                 libc::dup2(fd, 2);
             }
         }
+    }
+    if let Some(why) = gpu_why.filter(|_| syscalls::TRACE.load(Ordering::Relaxed)) {
+        eprintln!("[maclator] gpu=auto: bridge {} for {exe} ({why})", if gpu_active { "on" } else { "off" });
     }
     if gpu_active {
         // The host frameworks must be initialised before the guest runs: CoreFoundation's
@@ -318,9 +337,13 @@ fn fail(msg: &str) -> ! {
     std::process::exit(126);
 }
 
+/// `gpu_on=` / `gpu_off=` path prefixes from the config, for `gpu=auto` (see gpu::auto_decision).
+static GPU_RULES: std::sync::Mutex<(Vec<String>, Vec<String>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
+
 /// Read `key=value` lines from the auto-mode config and turn them into command-line options.
-/// Keys: `sysroot`, `dyld`, `gpu` (1/0), `mount` (mount point for the kit volume when the sysroot
-/// is absent); upper-case keys (e.g. `MCL_DS_FLAG=1`) are environment defaults for the guest.
+/// Keys: `sysroot`, `dyld`, `gpu` (1/0/auto), `gpu_on`/`gpu_off` (repeatable path prefixes for
+/// gpu=auto), `mount` (mount point for the kit volume when the sysroot is absent); upper-case keys
+/// (e.g. `MCL_DS_FLAG=1`) are environment defaults for the guest.
 fn auto_options(conf: &str) -> Vec<String> {
     let text = std::fs::read_to_string(conf).unwrap_or_else(|e| fail(&format!("{conf}: {e}")));
     let (mut opts, mut sysroot, mut mount) = (Vec::new(), None, None);
@@ -333,8 +356,12 @@ fn auto_options(conf: &str) -> Vec<String> {
             "gpu" => {
                 if v == "1" {
                     opts.push("--gpu".into());
+                } else if v == "auto" {
+                    opts.push("--gpu-auto".into());
                 }
             }
+            "gpu_on" => GPU_RULES.lock().unwrap().0.push(v.to_string()),
+            "gpu_off" => GPU_RULES.lock().unwrap().1.push(v.to_string()),
             "mount" => mount = Some(v.to_string()),
             "deny" | "allow" => {} // read by check_deny
             _ if k.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
@@ -425,4 +452,42 @@ fn resolve_path(p: &str) -> String {
         }
     }
     p.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn conf_gpu_auto() {
+        let dir = std::env::temp_dir().join(format!("mcl-conf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("maclator.conf");
+        let gdir = dir.join("gpu").to_string_lossy().into_owned();
+        std::fs::create_dir_all(&gdir).unwrap();
+        for f in ["libmclmetal.dylib", "libmclbridge.dylib"] {
+            std::fs::write(format!("{gdir}/{f}"), "").unwrap();
+        }
+        let text = format!(
+            "# sample\ngpu=auto\nMACLATOR_GPU_DIR={gdir}\ngpu_on=/System/Applications/Chess.app/\n\
+             gpu_on=/Applications/\ngpu_off=/Applications/Utilities/\ndeny=/nowhere\n"
+        );
+        std::fs::write(&conf, text).unwrap();
+        std::env::remove_var("MACLATOR_GPU_DIR");
+        assert_eq!(super::auto_options(&conf.to_string_lossy()), vec!["--gpu-auto".to_string()]);
+        assert_eq!(std::env::var("MACLATOR_GPU_DIR").unwrap(), gdir);
+        let r = super::GPU_RULES.lock().unwrap();
+        assert_eq!(r.0, ["/System/Applications/Chess.app/", "/Applications/"]);
+        assert_eq!(r.1, ["/Applications/Utilities/"]);
+        // The conf's MACLATOR_GPU_DIR is what inject's search finds, and it reaches the guest.
+        let mut envp = Vec::new();
+        assert!(super::gpu::inject(&mut envp));
+        assert_eq!(
+            envp,
+            [
+                format!("DYLD_INSERT_LIBRARIES={gdir}/libmclmetal.dylib"),
+                format!("MACLATOR_GPU_DIR={gdir}"),
+                format!("MACLATOR_GPU_BRIDGE={gdir}/libmclbridge.dylib"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
