@@ -294,6 +294,37 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
                 write_sysctl_str(cpu, args[2], args[3], "arm64");
                 return;
             }
+            // GG boot 75: sysctlbyname("hw.cputype") reached the guest as name2oid ({0,3}, name in newp)
+            // then __sysctl on the host's OID, so it got the host's 7/8. Hand out a private OID for
+            // every overridden name, and answer that OID from sysctl_override.
+            if args[1] == 2 && mib == [0, 3] && args[4] != 0 && args[2] != 0 && args[3] != 0 {
+                let raw = unsafe { std::slice::from_raw_parts(args[4] as *const u8, (args[5] as usize).min(256)) };
+                let name = String::from_utf8_lossy(raw.split(|&b| b == 0).next().unwrap_or(&[])).into_owned();
+                if sysctl_override(&name).is_some() {
+                    let mut names = FAKE_OIDS.lock().unwrap();
+                    let i = names.iter().position(|x| *x == name).unwrap_or_else(|| {
+                        names.push(name);
+                        names.len() - 1
+                    });
+                    unsafe {
+                        if *(args[3] as *const u64) < 8 {
+                            set_err(cpu, libc::ENOMEM as u64);
+                            return;
+                        }
+                        *(args[2] as *mut [i32; 2]) = [FAKE_OID, i as i32];
+                        *(args[3] as *mut u64) = 8;
+                    }
+                    set_ok(cpu, 0, 0);
+                    return;
+                }
+            }
+            if args[1] == 2 && mib[0] == FAKE_OID {
+                let name = FAKE_OIDS.lock().unwrap().get(mib[1] as usize).cloned();
+                if let Some(v) = name.as_deref().and_then(sysctl_override) {
+                    write_sysctl_int(cpu, args[2], args[3], v);
+                    return;
+                }
+            }
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
         }
@@ -564,6 +595,10 @@ fn write_sysctl_int(cpu: &mut Cpu, oldp: u64, oldlenp: u64, v: i64) {
     }
     set_ok(cpu, 0, 0);
 }
+
+/// Top-level OID no kernel uses; FAKE_OIDS[n] is the name behind {FAKE_OID, n}.
+const FAKE_OID: i32 = 0x4d4c;
+static FAKE_OIDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// sysctls whose answer must describe the emulated arm64 machine.
 fn sysctl_override(name: &str) -> Option<i64> {
